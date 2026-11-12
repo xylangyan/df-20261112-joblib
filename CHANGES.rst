@@ -4,6 +4,12 @@ Release Notes
 In Development
 --------------
 
+- Add ``MemorizedFunc.explain_call_in_cache``, a read-only explanation of
+  why a call would currently be served from the cache or recomputed. It
+  distinguishes missing entries, changed function definitions, invalid
+  metadata, rejected validation callbacks and callback errors without
+  loading cached results or modifying cache entries.
+
 .. note::
    This version changes the way functions defined in jupyter notebook are hashed.
    This invalidates existing cache and will automatically clear them in these cases.

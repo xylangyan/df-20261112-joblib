@@ -28,6 +28,7 @@ from joblib.hashing import hash
 from joblib.memory import (
     _FUNCTION_HASHES,
     _STORE_BACKENDS,
+    CacheCheckInfo,
     JobLibCollisionWarning,
     MemorizedFunc,
     MemorizedResult,
@@ -1894,3 +1895,199 @@ class TestAutoGitignore:
 
         assert gitignore_file.exists()
         assert gitignore_file.read_text() == existing_content
+
+
+class TestExplainCallInCache:
+    "Tests for the read-only cache explanation API."
+
+    @staticmethod
+    def f(x, counter):
+        counter[x] = counter.get(x, 0) + 1
+        return counter[x]
+
+    def test_explain_missing_and_valid(self, tmp_path):
+        memory = Memory(location=tmp_path, verbose=0)
+        f = memory.cache(self.f, ignore=["counter"])
+        counter = {}
+
+        info = f.explain_call_in_cache(2, counter)
+        assert isinstance(info, CacheCheckInfo)
+        assert not info.call_in_cache
+        assert info.reason == CacheCheckInfo.CACHE_MISSING
+        assert info.metadata is None
+        assert info.error is None
+        assert info.checked_at is not None
+        # The boolean check stays compatible with the explanation.
+        assert not f.check_call_in_cache(2, counter)
+
+        assert f(2, counter) == 1
+        info = f.explain_call_in_cache(2, counter)
+        assert info.call_in_cache
+        assert info.reason == CacheCheckInfo.CACHE_VALID
+        assert isinstance(info.metadata, dict)
+        assert "duration" in info.metadata
+        assert info.error is None
+        assert f.check_call_in_cache(2, counter)
+
+    def test_explain_caching_disabled(self):
+        f = NotMemorizedFunc(self.f)
+        info = f.explain_call_in_cache(2, {})
+        assert not info.call_in_cache
+        assert info.reason == CacheCheckInfo.CACHE_DISABLED
+        assert info.metadata is None
+
+    def test_explain_function_changed_is_read_only(self, tmp_path):
+        def func(a, b):
+            # Placeholder function mutated by the test
+            pass
+
+        func.__code__ = _sum.__code__
+        memory = Memory(location=tmp_path, verbose=0)
+        f = memory.cache(func)
+        assert f(1, 2) == 3
+
+        func.__code__ = _product.__code__
+        with warns(JobLibCollisionWarning):
+            info = f.explain_call_in_cache(1, 2)
+        assert not info.call_in_cache
+        assert info.reason == CacheCheckInfo.CACHE_FUNC_CHANGED
+        assert info.metadata is None
+
+        # The explanation is read-only: it neither cleared the cached
+        # result nor rewrote the function code. The invalidation happens
+        # when a normal call performs the same identity check.
+        args_id = f._get_args_id(1, 2)
+        call_id = (f.func_id, args_id)
+        assert f.store_backend.contains_item(call_id)
+        with warns(JobLibCollisionWarning):
+            info = f.explain_call_in_cache(1, 2)
+        assert info.reason == CacheCheckInfo.CACHE_FUNC_CHANGED
+        assert f(1, 2) == 2
+
+    def test_explain_unreadable_metadata(self, tmp_path):
+        memory = Memory(location=tmp_path, verbose=0)
+        f = memory.cache(self.f, ignore=["counter"])
+        counter = {}
+        assert f(2, counter) == 1
+
+        args_id = f._get_args_id(2, counter)
+        call_id = f.store_backend._split_id((f.func_id, args_id))
+        metadata_file = os.path.join(
+            f.store_backend.location, *call_id, "metadata.json"
+        )
+        with open(metadata_file, "w") as fd:
+            fd.write("not json")
+
+        info = f.explain_call_in_cache(2, counter)
+        assert not info.call_in_cache
+        assert info.reason == CacheCheckInfo.CACHE_METADATA_UNREADABLE
+        assert info.metadata == {}
+        assert info.error is None
+        # The explanation did not clear the cache entry.
+        assert f.store_backend.contains_item((f.func_id, args_id))
+
+    def test_explain_validation_callback_error(self, tmp_path):
+        def fail(metadata):
+            raise ValueError("cannot validate")
+
+        memory = Memory(location=tmp_path, verbose=0)
+        f = memory.cache(
+            self.f, ignore=["counter"], cache_validation_callback=fail
+        )
+        counter = {}
+        assert f(2, counter) == 1
+
+        info = f.explain_call_in_cache(2, counter)
+        assert not info.call_in_cache
+        assert info.reason == CacheCheckInfo.CACHE_CALLBACK_ERROR
+        assert isinstance(info.error, ValueError)
+        assert str(info.error) == "cannot validate"
+        assert isinstance(info.metadata, dict)
+        # The failed validation did not clear the cache entry.
+        args_id = f._get_args_id(2, counter)
+        assert f.store_backend.contains_item((f.func_id, args_id))
+
+    def test_explain_snapshot_and_read_only(self, tmp_path):
+        """Explain four cached entries without touching the cached results.
+
+        One validation callback flips its verdict after the pre-check: the
+        explanation stays a snapshot while the actual call re-validates at
+        read time. Load counts prove the pre-check never read the results.
+        """
+        verdict = {"valid": True}
+
+        def validation_callback(metadata):
+            return verdict["valid"]
+
+        memory = Memory(location=tmp_path, verbose=0)
+        f = memory.cache(
+            self.f,
+            ignore=["counter"],
+            cache_validation_callback=validation_callback,
+        )
+        counter = {}
+        # Populate four cached entries.
+        for x in range(4):
+            assert f(x, counter) == 1
+        assert counter == {0: 1, 1: 1, 2: 1, 3: 1}
+
+        # Count every load of a cached result body.
+        backend = f.store_backend
+        load_count = {"n": 0}
+        original_load_item = backend.load_item
+
+        def counting_load_item(*args, **kwargs):
+            load_count["n"] += 1
+            return original_load_item(*args, **kwargs)
+
+        # The result body access time must not be touched by the pre-check.
+        time.sleep(1)
+        args_id = f._get_args_id(0, counter)
+        output_file = os.path.join(
+            backend.location,
+            *backend._split_id((f.func_id, args_id)),
+            "output.pkl",
+        )
+        access_time_before = os.stat(output_file).st_atime
+
+        backend.load_item = counting_load_item
+        try:
+            explanations = [f.explain_call_in_cache(x, counter) for x in range(4)]
+            # The pre-check only read metadata, never the cached results.
+            assert load_count["n"] == 0
+            assert os.stat(output_file).st_atime == access_time_before
+
+            assert all(info.call_in_cache for info in explanations)
+            assert all(
+                info.reason == CacheCheckInfo.CACHE_VALID for info in explanations
+            )
+            assert all(isinstance(info.metadata, dict) for info in explanations)
+            assert all(info.error is None for info in explanations)
+            # Each explanation is a snapshot taken at a given moment.
+            assert all(info.checked_at is not None for info in explanations)
+
+            # The callback changes its verdict after the pre-check.
+            verdict["valid"] = False
+            # The explanations are snapshots: they are not updated.
+            assert all(info.call_in_cache for info in explanations)
+
+            # Actual calls re-validate at read time and recompute.
+            for x in range(4):
+                assert f(x, counter) == 2
+            assert load_count["n"] == 0
+            assert counter == {0: 2, 1: 2, 2: 2, 3: 2}
+
+            # A new pre-check agrees with the new verdict.
+            info = f.explain_call_in_cache(0, counter)
+            assert not info.call_in_cache
+            assert info.reason == CacheCheckInfo.CACHE_INVALID
+
+            # Restoring the verdict makes the recomputed entries usable
+            # again. The boolean check and the actual call agree with the
+            # new explanation.
+            verdict["valid"] = True
+            assert f.check_call_in_cache(0, counter)
+            assert f(0, counter) == 2
+            assert load_count["n"] == 1
+        finally:
+            backend.load_item = original_load_item

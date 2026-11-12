@@ -11,6 +11,7 @@ is called with the same input arguments.
 import asyncio
 import datetime
 import functools
+from dataclasses import dataclass
 import inspect
 import logging
 import os
@@ -159,6 +160,59 @@ def _build_func_identifier(func):
 # An in-memory store to avoid looking at the disk-based function
 # source code to check if a function definition has changed
 _FUNCTION_HASHES = weakref.WeakKeyDictionary()
+
+
+@dataclass(frozen=True)
+class CacheCheckInfo:
+    """Explanation of a cache availability check, captured at a given moment.
+
+    Instances are returned by
+    :meth:`MemorizedFunc.explain_call_in_cache`. They describe why a call
+    would, at the time of the check, be served from the cache or
+    recomputed. The check is read-only: it never loads the cached result,
+    never clears cache entries and never registers the function code, so it
+    does not disturb subsequent cache usage. A ``True`` ``call_in_cache``
+    is only a snapshot: a normal call re-evaluates the availability when it
+    actually reads the cache.
+
+    Attributes
+    ----------
+    call_in_cache: bool
+        Whether a normal call with the same arguments would use the cached
+        result at the moment of the check.
+    reason: str
+        Machine-readable cause of the decision, one of the ``CACHE_*``
+        class attributes (e.g. ``CacheCheckInfo.CACHE_MISSING``).
+    metadata: dict or None
+        The metadata of the cached call, as returned by the store backend,
+        when it could be read. None when the check did not reach the
+        metadata (no cache entry, changed function code, caching disabled)
+        or when the metadata could not be read. An empty dict is reported
+        as ``CACHE_METADATA_UNREADABLE`` since the store backend returns an
+        empty dict when the metadata cannot be decoded.
+    error: Exception or None
+        The exception raised by the ``cache_validation_callback``, when
+        the callback failed instead of returning a verdict. The exception
+        is captured for diagnostic purposes and never re-raised by the
+        check; a normal call would raise it again.
+    checked_at: float
+        Timestamp (``time.time()``) at which the check was performed,
+        making explicit that the explanation is a point-in-time judgement.
+    """
+
+    call_in_cache: bool
+    reason: str
+    metadata: dict = None
+    error: Exception = None
+    checked_at: float = None
+
+    CACHE_VALID = "valid"
+    CACHE_MISSING = "missing"
+    CACHE_FUNC_CHANGED = "function_changed"
+    CACHE_INVALID = "validation_failed"
+    CACHE_CALLBACK_ERROR = "validation_callback_error"
+    CACHE_METADATA_UNREADABLE = "metadata_unreadable"
+    CACHE_DISABLED = "caching_disabled"
 
 
 ###############################################################################
@@ -343,6 +397,14 @@ class NotMemorizedFunc(object):
     def check_call_in_cache(self, *args, **kwargs):
         return False
 
+    def explain_call_in_cache(self, *args, **kwargs):
+        """Return a read-only explanation of why the cache cannot be used."""
+        return CacheCheckInfo(
+            call_in_cache=False,
+            reason=CacheCheckInfo.CACHE_DISABLED,
+            checked_at=time.time(),
+        )
+
 
 ###############################################################################
 # class `AsyncNotMemorizedFunc`
@@ -492,6 +554,75 @@ class MemorizedFunc(Logger):
             return False
 
         return True
+
+    def _explain_call_in_cache(self, call_id):
+        """Build a read-only explanation for the availability of a call."""
+        checked_at = time.time()
+
+        # Check if this specific call is in the cache first. Without a
+        # cached result there is nothing to validate or load, so the
+        # missing-key reason is reported even when the function code has
+        # never been written yet.
+        if not self.store_backend.contains_item(call_id):
+            return CacheCheckInfo(
+                call_in_cache=False,
+                reason=CacheCheckInfo.CACHE_MISSING,
+                checked_at=checked_at,
+            )
+
+        # Check if the code of the function has changed without using the
+        # normal check's cache-clearing or function-code-writing behavior.
+        if not self._check_previous_func_code(read_only=True):
+            return CacheCheckInfo(
+                call_in_cache=False,
+                reason=CacheCheckInfo.CACHE_FUNC_CHANGED,
+                checked_at=checked_at,
+            )
+
+        # Read only the small metadata sidecar. The result body is not
+        # loaded, so its access time is not modified by this explanation.
+        metadata = self.store_backend.get_metadata(call_id)
+        if metadata == {}:
+            return CacheCheckInfo(
+                call_in_cache=False,
+                reason=CacheCheckInfo.CACHE_METADATA_UNREADABLE,
+                metadata=metadata,
+                checked_at=checked_at,
+            )
+
+        if self.cache_validation_callback is None:
+            return CacheCheckInfo(
+                call_in_cache=True,
+                reason=CacheCheckInfo.CACHE_VALID,
+                metadata=metadata,
+                checked_at=checked_at,
+            )
+
+        try:
+            is_valid = self.cache_validation_callback(metadata)
+        except Exception as error:
+            return CacheCheckInfo(
+                call_in_cache=False,
+                reason=CacheCheckInfo.CACHE_CALLBACK_ERROR,
+                metadata=metadata,
+                error=error,
+                checked_at=checked_at,
+            )
+
+        if not is_valid:
+            return CacheCheckInfo(
+                call_in_cache=False,
+                reason=CacheCheckInfo.CACHE_INVALID,
+                metadata=metadata,
+                checked_at=checked_at,
+            )
+
+        return CacheCheckInfo(
+            call_in_cache=True,
+            reason=CacheCheckInfo.CACHE_VALID,
+            metadata=metadata,
+            checked_at=checked_at,
+        )
 
     def _cached_call(self, args, kwargs, shelving):
         """Call wrapped function and cache result, or read cache if available.
@@ -650,6 +781,35 @@ class MemorizedFunc(Logger):
         call_id = (self.func_id, self._get_args_id(*args, **kwargs))
         return self._is_in_cache_and_valid(call_id)
 
+    def explain_call_in_cache(self, *args, **kwargs):
+        """Explain whether a call can currently be served from the cache.
+
+        This is a read-only counterpart of :meth:`check_call_in_cache`. It
+        returns a :class:`CacheCheckInfo` describing the current judgement
+        instead of a single boolean, so that a missing key, a changed
+        function definition, invalid metadata, a rejected validation
+        callback and a callback error can be told apart.
+
+        The explanation never loads the cached result (and therefore does
+        not update the result's access time), does not clear cache entries
+        and does not write the function code. It only hashes the arguments,
+        checks the function identity and reads the metadata sidecar when a
+        cache entry exists.
+
+        The returned explanation is a snapshot taken at ``checked_at``.
+        ``call_in_cache=True`` means that a regular call would use the
+        cached result if made at that instant; regular calls re-run the
+        same validation at read time, so a callback that changes its
+        verdict after this check can still cause a recomputation.
+
+        Returns
+        -------
+        explanation: CacheCheckInfo
+            The point-in-time reason for the cache decision.
+        """
+        call_id = (self.func_id, self._get_args_id(*args, **kwargs))
+        return self._explain_call_in_cache(call_id)
+
     # ------------------------------------------------------------------------
     # Private interface
     # ------------------------------------------------------------------------
@@ -690,10 +850,15 @@ class MemorizedFunc(Logger):
                 # Some callable are not hashable
                 pass
 
-    def _check_previous_func_code(self, stacklevel=2):
+    def _check_previous_func_code(self, stacklevel=2, read_only=False):
         """
         stacklevel is the depth a which this function is called, to
         issue useful warnings to the user.
+
+        read_only=True performs the same identity comparison without
+        modifying the cache: the function code is not (re)written when it
+        is missing and a detected change does not clear the cache. This is
+        used by the read-only cache explanations.
         """
         # First check if our function is in the in-memory store.
         # Using the in-memory store not only makes things faster, but it
@@ -719,7 +884,8 @@ class MemorizedFunc(Logger):
                 self.store_backend.get_cached_func_code([self.func_id])
             )
         except (IOError, OSError):  # some backend can also raise OSError
-            self._write_func_code(func_code, first_line)
+            if not read_only:
+                self._write_func_code(func_code, first_line)
             return False
         if old_func_code == func_code:
             return True
@@ -791,7 +957,8 @@ class MemorizedFunc(Logger):
                     func_name, self.func_id
                 )
             )
-        self.clear(warn=True)
+        if not read_only:
+            self.clear(warn=True)
         return False
 
     def clear(self, warn=True):

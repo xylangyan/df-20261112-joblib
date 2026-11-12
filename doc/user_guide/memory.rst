@@ -553,8 +553,30 @@ without actually needing to call the function itself::
     >>> func.check_call_in_cache(2)  # cache miss
     False
 
+When the boolean result is not enough to understand why a call would be
+recomputed, use
+:meth:`func.explain_call_in_cache <MemorizedFunc.explain_call_in_cache>`.
+It returns a :class:`CacheCheckInfo` describing the judgement at the time
+of the call, distinguishing a missing cache entry, a changed function
+definition, a rejected validation callback, a callback error and unreadable
+metadata::
+
+    >>> info = func.explain_call_in_cache(1)
+    >>> info.call_in_cache, info.reason
+    (True, 'valid')
+    >>> func.explain_call_in_cache(2).reason
+    'missing'
+
+The explanation is read-only: it does not load cached results (so their
+access time is not updated) and does not clear cache entries. It is only a
+snapshot; a regular call re-runs the cache validation when it actually reads
+the cache.
+
 .. autoclass:: MemorizedFunc
-    :members: __init__, call, clear, check_call_in_cache
+    :members: __init__, call, clear, check_call_in_cache, explain_call_in_cache
+
+.. autoclass:: CacheCheckInfo
+    :members:
 
 
 ..
