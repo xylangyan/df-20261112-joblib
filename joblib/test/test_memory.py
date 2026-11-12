@@ -24,6 +24,7 @@ from tempfile import TemporaryDirectory
 import pytest
 
 from joblib._store_backends import FileSystemStoreBackend, StoreBackendBase
+from joblib.disk import memstr_to_bytes
 from joblib.hashing import hash
 from joblib.memory import (
     _FUNCTION_HASHES,
@@ -1173,6 +1174,272 @@ def test_memory_reduce_size_age_limit(tmpdir):
     memory.reduce_size(age_limit=datetime.timedelta(seconds=0))
     cache_items = memory.store_backend.get_items()
     assert cache_items == []
+
+
+def test_preview_reduce_size_plan_fields_and_ordering(tmpdir):
+    # The plan lists its keys, is ordered by last access time with a stable
+    # tie-breaker and reports the size that would be reclaimed.
+    memory, _, _ = _setup_toy_cache(tmpdir, num_inputs=4)
+    backend = memory.store_backend
+    ref_items = sorted(backend.get_items(), key=lambda ci: ci.path)
+
+    plan = memory.preview_reduce_size(items_limit=2)
+
+    # Plan metadata mirrors the limits and the current store state.
+    assert plan.location == backend.location
+    assert plan.items_limit == 2
+    assert plan.bytes_limit is None
+    assert plan.age_limit is None
+    assert plan.item_count == 4
+    assert plan.total_size == sum(ci.size for ci in ref_items)
+
+    # Two of the four items are candidates, oldest first.
+    assert len(plan.entries) == 2
+    by_path = {ci.path: ci for ci in ref_items}
+    expected = sorted(ref_items, key=lambda ci: (ci.last_access, ci.path))[:2]
+    assert [entry.path for entry in plan.entries] == [ci.path for ci in expected]
+    assert [entry.key for entry in plan.entries] == [
+        os.path.relpath(ci.path, backend.location) for ci in expected
+    ]
+    # Each entry carries the same size and last access as the current item.
+    for entry in plan.entries:
+        item = by_path[entry.path]
+        assert entry.size == item.size
+        assert entry.last_access == item.last_access
+    assert plan.planned_reclaimed_size == sum(entry.size for entry in plan.entries)
+
+
+def test_preview_reduce_size_is_read_only(tmpdir):
+    # Building a plan must not refresh any access time nor touch metadata.
+    memory, _, _ = _setup_toy_cache(tmpdir, num_inputs=4)
+    backend = memory.store_backend
+    items = backend.get_items()
+
+    def snapshot():
+        return {
+            ci.path: (
+                ci.size,
+                ci.last_access,
+                os.path.getmtime(os.path.join(ci.path, "metadata.json")),
+                os.path.getatime(os.path.join(ci.path, "output.pkl")),
+            )
+            for ci in items
+        }
+
+    before = snapshot()
+    # Planning twice must return identical plans and leave the store intact.
+    plan_1 = memory.preview_reduce_size(bytes_limit="2K")
+    plan_2 = memory.preview_reduce_size(bytes_limit="2K")
+    assert plan_1.entries == plan_2.entries
+    assert snapshot() == before
+
+
+def test_preview_reduce_size_tie_break_is_stable(tmpdir):
+    # Items with identical last access times are ordered by key (path).
+    memory, _, _ = _setup_toy_cache(tmpdir, num_inputs=4)
+    backend = memory.store_backend
+    tie_time = datetime.datetime(2000, 1, 1)
+    for item in backend.get_items():
+        output = os.path.join(item.path, "output.pkl")
+        timestamp = tie_time.timestamp()
+        os.utime(output, (timestamp, timestamp))
+        os.utime(item.path, (timestamp, timestamp))
+
+    plan = memory.preview_reduce_size(items_limit=2)
+    keys = [entry.key for entry in plan.entries]
+    assert keys == sorted(keys)
+    assert keys == sorted(
+        os.path.relpath(ci.path, backend.location)
+        for ci in sorted(
+            backend.get_items(), key=lambda ci: (ci.last_access, ci.path)
+        )[:2]
+    )
+    # Rebuilding the plan keeps the exact same order.
+    rebuilt = memory.preview_reduce_size(items_limit=2)
+    assert [entry.key for entry in rebuilt.entries] == keys
+
+
+def test_apply_reduce_size_plan_reports_unchanged_missing_rewritten(tmpdir):
+    # Full workflow: 4 cached items, plan the eviction, then create one of
+    # each possible state (unchanged, missing, rewritten) before applying.
+    memory, _, cached_func = _setup_toy_cache(tmpdir, num_inputs=4)
+    backend = memory.store_backend
+    plan = memory.preview_reduce_size(items_limit=1)
+    assert len(plan.entries) == 3
+
+    entries = list(plan.entries)
+    unchanged_entry = entries[0]
+    missing_entry = entries[1]
+    rewritten_entry = entries[2]
+
+    # Rewrite the rewritten candidate: calling the cached function again
+    # replaces its output and refreshes its last access time.
+    arg_by_hash = {cached_func._get_args_id(arg): arg for arg in range(4)}
+    # The item path is location/func_id/<id[:3]>/<id[3:]>, see _split_id.
+    path_parts = os.path.relpath(rewritten_entry.path, backend.location).split(os.sep)
+    rewritten_hash = path_parts[-2] + path_parts[-1]
+    cached_func(arg_by_hash[rewritten_hash])
+
+    # Remove the missing candidate directly on disk.
+    shutil.rmtree(missing_entry.path)
+
+    listing_before = sorted(
+        os.path.relpath(ci.path, backend.location) for ci in backend.get_items()
+    )
+
+    report = memory.apply_reduce_size_plan(plan)
+
+    listing_after = sorted(
+        os.path.relpath(ci.path, backend.location) for ci in backend.get_items()
+    )
+
+    statuses = {entry.key: entry.status for entry in report.entries}
+    assert statuses == {
+        unchanged_entry.key: "deleted",
+        missing_entry.key: "missing",
+        rewritten_entry.key: "rewritten",
+    }
+    assert report.deleted == (unchanged_entry.key,)
+    assert report.missing == (missing_entry.key,)
+    assert report.rewritten == (rewritten_entry.key,)
+
+    # Only the unchanged candidate was actually removed; the rewritten one
+    # was kept and the missing one was already gone.
+    assert unchanged_entry.key not in listing_after
+    assert rewritten_entry.key in listing_after
+    assert missing_entry.key not in listing_after
+    assert len(listing_after) == len(listing_before) - 1
+
+    # Reclaimed size only accounts for the actually deleted item.
+    assert report.reclaimed_size == unchanged_entry.size
+    assert report.planned_reclaimed_size == plan.planned_reclaimed_size
+    difference = report.planned_reclaimed_size - report.reclaimed_size
+    assert difference == missing_entry.size + rewritten_entry.size
+
+    # Applying the same plan twice frees nothing more: the previously
+    # deleted and the originally missing entries are now both reported as
+    # missing, while the rewritten entry is still kept.
+    second_report = memory.apply_reduce_size_plan(plan)
+    assert set(second_report.missing) == {
+        unchanged_entry.key,
+        missing_entry.key,
+    }
+    assert second_report.rewritten == (rewritten_entry.key,)
+    assert second_report.reclaimed_size == 0
+
+
+def test_apply_reduce_size_plan_matches_actual_freed_space(tmpdir):
+    # The reclaimed size reported when all items are unchanged matches the
+    # size difference measured on disk before and after application.
+    memory, _, _ = _setup_toy_cache(tmpdir, num_inputs=4)
+    backend = memory.store_backend
+
+    def store_size():
+        items = backend.get_items()
+        return sum(ci.size for ci in items), items
+
+    size_before, items_before = store_size()
+    plan = memory.preview_reduce_size(items_limit=2)
+    assert len(plan.entries) == 2
+
+    report = memory.apply_reduce_size_plan(plan)
+    size_after, items_after = store_size()
+
+    assert len(items_after) == 2
+    assert size_before - size_after == report.reclaimed_size
+    assert report.reclaimed_size == plan.planned_reclaimed_size
+    assert report.planned_reclaimed_size - report.reclaimed_size == 0
+    # Every planned item was deleted.
+    assert set(report.deleted) == {entry.key for entry in plan.entries}
+
+
+def test_preview_reduce_size_plan_is_serializable(tmpdir):
+    # The plan is kept for review by the next shift, so it must round-trip
+    # through pickle without referencing open file handles.
+    memory, _, _ = _setup_toy_cache(tmpdir, num_inputs=4)
+    plan = memory.preview_reduce_size(items_limit=2)
+    restored = pickle.loads(pickle.dumps(plan))
+    assert restored == plan
+    report = memory.apply_reduce_size_plan(restored)
+    assert len(report.deleted) == 2
+
+
+def test_apply_reduce_size_plan_refuses_foreign_store(tmpdir):
+    memory, _, _ = _setup_toy_cache(tmpdir, num_inputs=4)
+    plan = memory.preview_reduce_size(items_limit=2)
+
+    with TemporaryDirectory() as other_dir:
+        other_memory = Memory(location=other_dir, verbose=0)
+        with pytest.raises(ValueError, match="cannot be applied"):
+            other_memory.apply_reduce_size_plan(plan)
+
+
+def test_preview_reduce_size_reuses_reduce_size_semantics(tmpdir):
+    # The plan selects exactly the items reduce_size would delete, for the
+    # size, item count and age limits.
+    memory, _, put_cache = _setup_toy_cache(tmpdir, num_inputs=4)
+    backend = memory.store_backend
+
+    def plan_keys(**limits):
+        plan = memory.preview_reduce_size(**limits)
+        return plan, [entry.key for entry in plan.entries]
+
+    def delete_keys(**limits):
+        return [
+            os.path.relpath(item.path, backend.location)
+            for item in backend._get_items_to_delete(
+                limits.get("bytes_limit"),
+                limits.get("items_limit"),
+                limits.get("age_limit"),
+            )
+        ]
+
+    for limits in [
+        {"bytes_limit": "1K"},
+        {"items_limit": 2},
+        {"items_limit": 0},
+        {"bytes_limit": "2K", "items_limit": 2},
+    ]:
+        plan, keys = plan_keys(**limits)
+        assert keys == delete_keys(**limits)
+        # The plan keeps the requested limits (a string bytes limit is
+        # converted to a number of bytes).
+        if "items_limit" in limits:
+            assert plan.items_limit == limits["items_limit"]
+        if "bytes_limit" in limits:
+            assert plan.bytes_limit == memstr_to_bytes(limits["bytes_limit"])
+
+    # Age limit: create two fresh items after a one second delay so that
+    # the older ones are selected for deletion.
+    time.sleep(1)
+    put_cache(10)
+    put_cache(11)
+    age_limits = {"age_limit": datetime.timedelta(seconds=1)}
+    plan, keys = plan_keys(**age_limits)
+    assert keys == delete_keys(**age_limits)
+    assert plan.age_limit == age_limits["age_limit"]
+    assert len(keys) == 4
+
+    with pytest.raises(ValueError, match="has to be a positive"):
+        memory.preview_reduce_size(age_limit=datetime.timedelta(seconds=-1))
+
+
+def test_preview_reduce_size_noop_cases(tmpdir):
+    # No limit or no store backend yields None instead of an empty plan.
+    memory, _, _ = _setup_toy_cache(tmpdir, num_inputs=4)
+    assert memory.preview_reduce_size() is None
+
+    no_cache_memory = Memory(location=None, verbose=0)
+    assert no_cache_memory.preview_reduce_size(items_limit=2) is None
+    assert no_cache_memory.apply_reduce_size_plan(None) is None
+
+    # A plan that selects nothing applies without error and frees nothing.
+    empty_plan = memory.preview_reduce_size(items_limit=10)
+    assert empty_plan.entries == ()
+    assert empty_plan.planned_reclaimed_size == 0
+    report = memory.apply_reduce_size_plan(empty_plan)
+    assert report.reclaimed_size == 0
+    assert report.entries == ()
 
 
 def test_memory_clear(tmpdir):

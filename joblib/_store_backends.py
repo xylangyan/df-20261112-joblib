@@ -13,6 +13,7 @@ import types
 import uuid
 import warnings
 from abc import ABCMeta, abstractmethod
+from dataclasses import dataclass
 from pickle import PicklingError
 
 from . import numpy_pickle
@@ -21,6 +22,131 @@ from .disk import memstr_to_bytes, mkdirp, rm_subdirs
 from .logger import format_time
 
 CacheItemInfo = collections.namedtuple("CacheItemInfo", "path size last_access")
+
+
+@dataclass(frozen=True)
+class EvictionPlanEntry:
+    """A single cache item selected for eviction by an eviction plan.
+
+    Parameters
+    ----------
+    key: str
+        Identifier of the cache item. For the file system backend, this is
+        the path of the item relative to the store location.
+    size: int
+        Size in bytes of the item at plan creation time.
+    last_access: datetime.datetime
+        Last access time of the item at plan creation time. Entries are
+        ordered by this field, oldest first, with ``key`` as a stable
+        tie-breaker.
+    path: str
+        Absolute location of the item in the store.
+    """
+
+    key: str
+    size: int
+    last_access: datetime.datetime
+    path: str
+
+
+@dataclass(frozen=True)
+class CacheEvictionPlan:
+    """Preview of the cache items that would be evicted to enforce limits.
+
+    Created by ``StoreBackendMixin.plan_store_limits`` (exposed on
+    ``Memory`` as ``Memory.preview_reduce_size``). It is a pure snapshot:
+    creating it does not refresh access times nor modify any metadata.
+    It can be stored (e.g. serialized) for later review and applied with
+    ``StoreBackendMixin.apply_eviction_plan``.
+
+    Parameters
+    ----------
+    entries: tuple of EvictionPlanEntry
+        Items selected for eviction, ordered by ``last_access`` (oldest
+        first), with ``key`` as a stable tie-breaker for identical
+        timestamps.
+    bytes_limit, items_limit, age_limit:
+        The limits the plan was created for, with the same meaning as in
+        ``Memory.reduce_size``.
+    total_size: int
+        Total size in bytes of the store when the plan was created.
+    item_count: int
+        Total number of items in the store when the plan was created.
+    created_at: datetime.datetime
+        Time at which the plan was created.
+    location: str
+        Location of the store the plan was created for. Applying the plan
+        to another store is refused.
+    """
+
+    entries: tuple
+    bytes_limit: int
+    items_limit: int
+    age_limit: datetime.timedelta
+    total_size: int
+    item_count: int
+    created_at: datetime.datetime
+    location: str = None
+
+    @property
+    def planned_reclaimed_size(self):
+        """Total size in bytes expected to be freed by this plan."""
+        return sum(entry.size for entry in self.entries)
+
+
+@dataclass(frozen=True)
+class EvictionReportEntry:
+    """Outcome of a single planned eviction.
+
+    ``status`` is one of:
+
+    - ``"deleted"``: the item was unchanged since the plan was created and
+      has been removed;
+    - ``"missing"``: the item did not exist anymore at application time,
+      nothing was done;
+    - ``"rewritten"``: the item was modified since the plan was created, it
+      has been kept and its size was not reclaimed.
+    """
+
+    key: str
+    status: str
+    reclaimed_size: int
+
+
+@dataclass(frozen=True)
+class CacheEvictionReport:
+    """Result of applying a ``CacheEvictionPlan``.
+
+    Parameters
+    ----------
+    entries: tuple of EvictionReportEntry
+        One entry per planned item, in the same order as the plan.
+    reclaimed_size: int
+        Total size in bytes actually freed.
+    planned_reclaimed_size: int
+        Total size in bytes the plan expected to free. The difference
+        ``planned_reclaimed_size - reclaimed_size`` accounts for items
+        that were missing or rewritten between planning and application.
+    """
+
+    entries: tuple
+    reclaimed_size: int
+    planned_reclaimed_size: int
+
+    @property
+    def deleted(self):
+        """Keys of the items that were actually removed."""
+        return tuple(e.key for e in self.entries if e.status == "deleted")
+
+    @property
+    def missing(self):
+        """Keys of the items that no longer existed at application time."""
+        return tuple(e.key for e in self.entries if e.status == "missing")
+
+    @property
+    def rewritten(self):
+        """Keys of the items that were rewritten and therefore kept."""
+        return tuple(e.key for e in self.entries if e.status == "rewritten")
 
 
 class CacheWarning(Warning):
@@ -332,14 +458,139 @@ class StoreBackendMixin(object):
                 # the folder already.
                 pass
 
-    def _get_items_to_delete(self, bytes_limit, items_limit=None, age_limit=None):
-        """
-        Get items to delete to keep the store under size, file, & age limits.
+    def plan_store_limits(self, bytes_limit, items_limit=None, age_limit=None):
+        """Preview the items that enforcing the limits would evict.
+
+        The limits have the same meaning as in ``enforce_store_limits``.
+        Building the plan is read-only: it does not refresh access times
+        nor modify any metadata of the store.
+
+        Returns
+        -------
+        plan: CacheEvictionPlan
+            A snapshot of the candidate evictions, ordered by last access
+            time (oldest first) with the item key as a stable tie-breaker,
+            together with the size expected to be reclaimed. The plan can
+            be kept for review and applied later with
+            ``apply_eviction_plan``.
         """
         if isinstance(bytes_limit, str):
             bytes_limit = memstr_to_bytes(bytes_limit)
 
         items = self.get_items()
+        items_to_delete = self._select_items_to_delete(
+            items, bytes_limit, items_limit, age_limit
+        )
+
+        entries = tuple(
+            EvictionPlanEntry(
+                key=self._eviction_key(item),
+                size=item.size,
+                last_access=item.last_access,
+                path=item.path,
+            )
+            for item in items_to_delete
+        )
+
+        return CacheEvictionPlan(
+            entries=entries,
+            bytes_limit=bytes_limit,
+            items_limit=items_limit,
+            age_limit=age_limit,
+            total_size=sum(item.size for item in items),
+            item_count=len(items),
+            created_at=datetime.datetime.now(),
+            location=self.location,
+        )
+
+    def apply_eviction_plan(self, plan):
+        """Apply a plan previously created by ``plan_store_limits``.
+
+        Each planned item is checked against the current state of the
+        store before being removed:
+
+        - unchanged items are deleted;
+        - items that do not exist anymore are skipped;
+        - items that have been rewritten since the plan was created are
+          kept and reported as such.
+
+        Returns
+        -------
+        report: CacheEvictionReport
+            The per-item outcome and the size actually reclaimed, to be
+            compared with ``plan.planned_reclaimed_size``.
+        """
+        if plan.location is not None and plan.location != self.location:
+            raise ValueError(
+                "This eviction plan was created for the store at "
+                f"{plan.location!r} and cannot be applied to the store at "
+                f"{self.location!r}."
+            )
+
+        report_entries = []
+        reclaimed_size = 0
+
+        for entry in plan.entries:
+            signature = self._eviction_entry_signature(entry.path)
+            if signature is None:
+                status, reclaimed = "missing", 0
+            elif signature != (entry.size, entry.last_access):
+                # The item changed since the plan was created: keep it.
+                status, reclaimed = "rewritten", 0
+            else:
+                try:
+                    self.clear_location(entry.path)
+                except OSError:
+                    # Already deleted by another process, see
+                    # enforce_store_limits.
+                    status, reclaimed = "missing", 0
+                else:
+                    status, reclaimed = "deleted", entry.size
+
+            reclaimed_size += reclaimed
+            report_entries.append(
+                EvictionReportEntry(
+                    key=entry.key, status=status, reclaimed_size=reclaimed
+                )
+            )
+
+        return CacheEvictionReport(
+            entries=tuple(report_entries),
+            reclaimed_size=reclaimed_size,
+            planned_reclaimed_size=plan.planned_reclaimed_size,
+        )
+
+    def _eviction_key(self, item):
+        """Return a stable identifier for a store item."""
+        return os.path.relpath(item.path, self.location)
+
+    def _eviction_entry_signature(self, path):
+        """Return the (size, last_access) signature of an item, or None.
+
+        Returns None if the item does not exist anymore. This is used to
+        detect items that were rewritten since an eviction plan was
+        created.
+        """
+        return None
+
+    def _get_items_to_delete(self, bytes_limit, items_limit=None, age_limit=None):
+        """
+        Get items to delete to keep the store under size, file, & age limits.
+        """
+        return self._select_items_to_delete(
+            self.get_items(), bytes_limit, items_limit, age_limit
+        )
+
+    def _select_items_to_delete(
+        self, items, bytes_limit, items_limit=None, age_limit=None
+    ):
+        """
+        Select items to delete from a snapshot of the store, given as a list
+        of ``CacheItemInfo``, to keep the store under size, file, & age limits.
+        """
+        if isinstance(bytes_limit, str):
+            bytes_limit = memstr_to_bytes(bytes_limit)
+
         if not items:
             return []
 
@@ -371,8 +622,9 @@ class StoreBackendMixin(object):
             return []
 
         # We want to delete first the cache items that were accessed a
-        # long time ago
-        items.sort(key=operator.attrgetter("last_access"))
+        # long time ago. The path is used as a tie-breaker so that items
+        # with identical last access times are evicted in a stable order.
+        items.sort(key=operator.attrgetter("last_access", "path"))
 
         items_to_delete = []
         size_so_far = 0
@@ -529,36 +781,57 @@ class FileSystemStoreBackend(StoreBackendBase, StoreBackendMixin):
         items = []
 
         for dirpath, _, filenames in os.walk(self.location):
-            parent, basename = os.path.split(dirpath)
-            if not _check_hex(basename, 32):
-                if not _check_hex(basename, 29):
-                    continue
-                if not _check_hex(os.path.basename(parent), 3):
-                    continue
-
-            output_filename = os.path.join(dirpath, "output.pkl")
-            try:
-                last_access = os.path.getatime(output_filename)
-            except OSError:
-                try:
-                    last_access = os.path.getatime(dirpath)
-                except OSError:
-                    # The directory has already been deleted
-                    continue
-
-            last_access = datetime.datetime.fromtimestamp(last_access)
-            try:
-                full_filenames = [os.path.join(dirpath, fn) for fn in filenames]
-                dirsize = sum(os.path.getsize(fn) for fn in full_filenames)
-            except OSError:
-                # Either output_filename or one of the files in
-                # dirpath does not exist any more. We assume this
-                # directory is being cleaned by another process already
-                continue
-
-            items.append(CacheItemInfo(dirpath, dirsize, last_access))
+            item = self._get_item_info(dirpath, filenames)
+            if item is not None:
+                items.append(item)
 
         return items
+
+    def _get_item_info(self, dirpath, filenames=None):
+        """Return the CacheItemInfo of an item directory, or None.
+
+        Returns None if the directory does not hold a cache item or if it
+        has been deleted concurrently. The size and last access time are
+        computed exactly like ``get_items`` so that they can be used to
+        detect items rewritten after an eviction plan was created.
+        """
+        parent, basename = os.path.split(dirpath)
+        if not _check_hex(basename, 32):
+            if not _check_hex(basename, 29):
+                return None
+            if not _check_hex(os.path.basename(parent), 3):
+                return None
+
+        output_filename = os.path.join(dirpath, "output.pkl")
+        try:
+            last_access = os.path.getatime(output_filename)
+        except OSError:
+            try:
+                last_access = os.path.getatime(dirpath)
+            except OSError:
+                # The directory has already been deleted
+                return None
+
+        last_access = datetime.datetime.fromtimestamp(last_access)
+        try:
+            if filenames is None:
+                filenames = os.listdir(dirpath)
+            full_filenames = [os.path.join(dirpath, fn) for fn in filenames]
+            dirsize = sum(os.path.getsize(fn) for fn in full_filenames)
+        except OSError:
+            # Either output_filename or one of the files in
+            # dirpath does not exist any more. We assume this
+            # directory is being cleaned by another process already
+            return None
+
+        return CacheItemInfo(dirpath, dirsize, last_access)
+
+    def _eviction_entry_signature(self, path):
+        """Return the current (size, last_access) of a planned item."""
+        item = self._get_item_info(path)
+        if item is None:
+            return None
+        return item.size, item.last_access
 
     def configure(self, location, verbose=1, backend_options=None):
         """Configure the store backend.

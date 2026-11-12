@@ -1210,6 +1210,79 @@ class Memory(Logger):
         # Defers the actual limits enforcing to the store backend.
         self.store_backend.enforce_store_limits(bytes_limit, items_limit, age_limit)
 
+    def preview_reduce_size(
+        self, bytes_limit=None, items_limit=None, age_limit=None
+    ):
+        """Preview the cache elements that enforcing the limits would remove.
+
+        The limits have the same meaning as in ``reduce_size``: the cache
+        size fits in ``bytes_limit``, the number of items is no more than
+        ``items_limit`` and no item was last accessed earlier than
+        ``age_limit``. Building the preview is read-only: it does not
+        refresh access times nor modify any metadata.
+
+        Parameters
+        ----------
+        bytes_limit: int | str, optional
+            Limit in bytes of the size of the cache. By default, the size of
+            the cache is unlimited. If a str is passed, it is converted to a
+            number of bytes using units {K | M | G} for kilo, mega, giga.
+
+        items_limit: int, optional
+            Number of items to limit the cache to. By default, the number of
+            items in the cache is unlimited.
+
+        age_limit: datetime.timedelta, optional
+            Maximum age of items to limit the cache to. Any item last
+            accessed more than the given length of time ago is selected for
+            deletion. Negative timedeltas are not accepted.
+
+        Returns
+        -------
+        plan: CacheEvictionPlan
+            The ordered list of candidate items (oldest last access first,
+            with the item key as a stable tie-breaker) and the size expected
+            to be reclaimed. Keep this object and pass it to
+            ``apply_reduce_size_plan`` to apply the same plan after review.
+        """
+        if self.store_backend is None:
+            # No cached results, nothing to preview.
+            return None
+
+        if bytes_limit is None and items_limit is None and age_limit is None:
+            # No limitation to impose, returning
+            return None
+
+        return self.store_backend.plan_store_limits(
+            bytes_limit, items_limit, age_limit
+        )
+
+    def apply_reduce_size_plan(self, plan):
+        """Apply an eviction plan previously returned by ``preview_reduce_size``.
+
+        Items that have not changed since the preview are deleted. Items
+        that do not exist anymore are skipped, and items that have been
+        rewritten since the preview are kept and reported instead of being
+        deleted.
+
+        Parameters
+        ----------
+        plan: CacheEvictionPlan
+            The plan returned by a previous call to ``preview_reduce_size``.
+
+        Returns
+        -------
+        report: CacheEvictionReport
+            The per-item outcome (``"deleted"``, ``"missing"`` or
+            ``"rewritten"``), the size actually freed and the size the plan
+            expected to free.
+        """
+        if self.store_backend is None or plan is None:
+            # No cached results or empty plan: nothing to apply.
+            return None
+
+        return self.store_backend.apply_eviction_plan(plan)
+
     def eval(self, func, *args, **kwargs):
         """Eval function func with arguments `*args` and `**kwargs`,
         in the context of the memory.

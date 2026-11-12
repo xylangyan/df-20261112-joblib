@@ -36,6 +36,13 @@ In Development
   calls can reuse its cached result.
   https://github.com/joblib/joblib/pull/1897
 
+- Add ``Memory.preview_reduce_size`` and ``Memory.apply_reduce_size_plan`` to
+  preview which cache items ``reduce_size`` would evict and apply the reviewed
+  plan later. The preview is read-only, orders candidates by last access time
+  with a stable tie-breaker, and reports the size expected to be reclaimed.
+  Application deletes unchanged items, skips items that no longer exist, and
+  keeps items that were rewritten since the preview, reporting each outcome.
+
 - ``FileSystemStoreBackend`` (and hence ``Memory``) now stores its items using the format
   "abc/defghijklmnopqrstuvwxyzabcdef/output.pkl" instead of
   "abcdefghijklmnopqrstuvwxyzabcdef/output.pkl" in order to limit the number

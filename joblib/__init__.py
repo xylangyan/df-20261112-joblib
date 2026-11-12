@@ -113,7 +113,11 @@ import os
 
 from ._cloudpickle_wrapper import wrap_non_picklable_objects
 from ._parallel_backends import ParallelBackendBase
-from ._store_backends import StoreBackendBase
+from ._store_backends import (
+    CacheEvictionPlan,
+    CacheEvictionReport,
+    StoreBackendBase,
+)
 from .compressor import register_compressor
 from .hashing import hash
 from .logger import Logger, PrintTime
@@ -133,6 +137,8 @@ __all__ = [
     # On-disk result caching
     "Memory",
     "MemorizedResult",
+    "CacheEvictionPlan",
+    "CacheEvictionReport",
     "expires_after",
     # Parallel code execution
     "Parallel",

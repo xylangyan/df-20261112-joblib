@@ -524,7 +524,8 @@ Reference documentation of the :class:`~joblib.Memory` class
 ------------------------------------------------------------
 
 .. autoclass:: joblib.Memory
-    :members: __init__, cache, eval, clear, reduce_size, format
+    :members: __init__, cache, eval, clear, reduce_size, preview_reduce_size,
+        apply_reduce_size_plan, format
     :no-inherited-members:
     :noindex:
 
