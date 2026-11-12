@@ -1,0 +1,20 @@
+version: 2
+
+# Set the version of Python and OS
+build:
+  os: ubuntu-lts-latest
+  tools:
+    python: "3.13"
+
+python:
+  # make sure joblib is installed in the virtualenv (it is imported in
+  # conf.py)
+  install:
+    - method: pip
+      path: .
+      extra_requirements:
+        - docs
+
+sphinx:
+  fail_on_warning: true
+  configuration: doc/conf.py

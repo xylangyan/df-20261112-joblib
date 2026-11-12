@@ -1,0 +1,707 @@
+"""Storage providers backends for Memory caching."""
+
+import collections
+import datetime
+import json
+import operator
+import os
+import os.path
+import shutil
+import threading
+import time
+import types
+import uuid
+import warnings
+from abc import ABCMeta, abstractmethod
+from pickle import PicklingError
+
+from . import numpy_pickle
+from .backports import concurrency_safe_rename
+from .disk import memstr_to_bytes, mkdirp, rm_subdirs
+from .logger import format_time
+
+CacheItemInfo = collections.namedtuple("CacheItemInfo", "path size last_access")
+
+
+class CacheWarning(Warning):
+    """Warning to capture dump failures except for PicklingError."""
+
+    pass
+
+
+class StoreBackendBase(metaclass=ABCMeta):
+    """Helper Abstract Base Class which defines all methods that
+    a StorageBackend must implement."""
+
+    location = None
+
+    @abstractmethod
+    def _open_item(self, f, mode):
+        """Opens an item on the store and return a file-like object.
+
+        This method is private and only used by the StoreBackendMixin object.
+
+        Parameters
+        ----------
+        f: a file-like object
+            The file-like object where an item is stored and retrieved
+        mode: string, optional
+            the mode in which the file-like object is opened allowed valued are
+            'rb', 'wb'
+
+        Returns
+        -------
+        a file-like object
+        """
+
+    @abstractmethod
+    def _item_exists(self, location):
+        """Checks if an item location exists in the store.
+
+        This method is private and only used by the StoreBackendMixin object.
+
+        Parameters
+        ----------
+        location: string
+            The location of an item. On a filesystem, this corresponds to the
+            absolute path, including the filename, of a file.
+
+        Returns
+        -------
+        True if the item exists, False otherwise
+        """
+
+    @abstractmethod
+    def _unlink_item(self, location):
+        """Unlink an item from the store.
+
+        This method is private and only used by the StoreBackendMixin object.
+
+        Parameters
+        ----------
+        location: string
+            The location of an item. On a filesystem, this corresponds to the
+            absolute path, including the filename, of a file.
+        """
+
+    @abstractmethod
+    def _move_item(self, src, dst):
+        """Moves an item from src to dst in the store.
+
+        This method is private and only used by the StoreBackendMixin object.
+
+        Parameters
+        ----------
+        src: string
+            The source location of an item
+        dst: string
+            The destination location of an item
+        """
+
+    @abstractmethod
+    def create_location(self, location):
+        """Creates a location on the store.
+
+        Parameters
+        ----------
+        location: string
+            The location in the store. On a filesystem, this corresponds to a
+            directory.
+        """
+
+    @abstractmethod
+    def clear_location(self, location):
+        """Clears a location on the store.
+
+        Parameters
+        ----------
+        location: string
+            The location in the store. On a filesystem, this corresponds to a
+            directory or a filename absolute path
+        """
+
+    @abstractmethod
+    def get_items(self):
+        """Returns the whole list of items available in the store.
+
+        Returns
+        -------
+        The list of items identified by their ids (e.g filename in a
+        filesystem).
+        """
+
+    @abstractmethod
+    def configure(self, location, verbose=0, backend_options=dict()):
+        """Configures the store.
+
+        Parameters
+        ----------
+        location: string
+            The base location used by the store. On a filesystem, this
+            corresponds to a directory.
+        verbose: int
+            The level of verbosity of the store
+        backend_options: dict
+            Contains a dictionary of named parameters used to configure the
+            store backend.
+        """
+
+
+class StoreBackendMixin(object):
+    """Class providing all logic for managing the store in a generic way.
+
+    The StoreBackend subclass has to implement 3 methods: create_location,
+    clear_location and configure. The StoreBackend also has to provide
+    a private _open_item, _item_exists, _unlink_item and _move_item methods.
+    The _open_item method has to have the same signature as the builtin open
+    and return a file-like object.
+    """
+
+    def load_item(self, call_id, verbose=1, timestamp=None, metadata=None):
+        """Load an item from the store given its id as a list of str."""
+        full_path = os.path.join(self.location, *call_id)
+
+        if verbose > 1:
+            ts_string = (
+                "{: <16}".format(format_time(time.time() - timestamp))
+                if timestamp is not None
+                else ""
+            )
+            signature = os.path.basename(call_id[0])
+            if metadata is not None and "input_args" in metadata:
+                kwargs = ", ".join(
+                    "{}={}".format(*item) for item in metadata["input_args"].items()
+                )
+                signature += "({})".format(kwargs)
+            msg = "[Memory]{}: Loading {}".format(ts_string, signature)
+            if verbose < 10:
+                print("{0}...".format(msg))
+            else:
+                print("{0} from {1}".format(msg, full_path))
+
+        mmap_mode = None if not hasattr(self, "mmap_mode") else self.mmap_mode
+
+        filename = os.path.join(full_path, "output.pkl")
+        if not self._item_exists(filename):
+            raise KeyError(
+                "Non-existing item (may have been "
+                "cleared).\nFile %s does not exist" % filename
+            )
+
+        # file-like object cannot be used when mmap_mode is set
+        if mmap_mode is None:
+            with self._open_item(filename, "rb") as f:
+                item = numpy_pickle.load(f)
+        else:
+            item = numpy_pickle.load(filename, mmap_mode=mmap_mode)
+        return item
+
+    def dump_item(self, call_id, item, verbose=1):
+        """Dump an item in the store at the id given as a list of str."""
+        try:
+            item_path = os.path.join(self.location, *call_id)
+            if not self._item_exists(item_path):
+                self.create_location(item_path)
+            filename = os.path.join(item_path, "output.pkl")
+            if verbose > 10:
+                print("Persisting in %s" % item_path)
+
+            def write_func(to_write, dest_filename):
+                with self._open_item(dest_filename, "wb") as f:
+                    try:
+                        numpy_pickle.dump(to_write, f, compress=self.compress)
+                    except PicklingError as e:
+                        # TODO(1.5) turn into error
+                        warnings.warn(
+                            "Unable to cache to disk: failed to pickle "
+                            "output. In version 1.5 this will raise an "
+                            f"exception. Exception: {e}.",
+                            FutureWarning,
+                        )
+
+            self._concurrency_safe_write(item, filename, write_func)
+        except Exception as e:  # noqa: E722
+            warnings.warn(
+                "Unable to cache to disk. Possibly a race condition in the "
+                f"creation of the directory. Exception: {e}.",
+                CacheWarning,
+            )
+
+    def clear_item(self, call_id):
+        """Clear the item at the id, given as a list of str."""
+        item_path = os.path.join(self.location, *call_id)
+        if self._item_exists(item_path):
+            self.clear_location(item_path)
+
+    def contains_item(self, call_id):
+        """Check if there is an item at the id, given as a list of str."""
+        item_path = os.path.join(self.location, *call_id)
+        filename = os.path.join(item_path, "output.pkl")
+
+        return self._item_exists(filename)
+
+    def get_item_info(self, call_id):
+        """Return information about item."""
+        return {"location": os.path.join(self.location, *call_id)}
+
+    def get_metadata(self, call_id):
+        """Return actual metadata of an item."""
+        try:
+            item_path = os.path.join(self.location, *call_id)
+            filename = os.path.join(item_path, "metadata.json")
+            with self._open_item(filename, "rb") as f:
+                return json.loads(f.read().decode("utf-8"))
+        except:  # noqa: E722
+            return {}
+
+    def store_metadata(self, call_id, metadata):
+        """Store metadata of a computation."""
+        try:
+            item_path = os.path.join(self.location, *call_id)
+            self.create_location(item_path)
+            filename = os.path.join(item_path, "metadata.json")
+
+            def write_func(to_write, dest_filename):
+                with self._open_item(dest_filename, "wb") as f:
+                    f.write(json.dumps(to_write).encode("utf-8"))
+
+            self._concurrency_safe_write(metadata, filename, write_func)
+        except:  # noqa: E722
+            pass
+
+    def contains_path(self, call_id):
+        """Check cached function is available in store."""
+        func_path = os.path.join(self.location, *call_id)
+        return self._item_exists(func_path)
+
+    def clear_path(self, call_id):
+        """Clear all items with a common path in the store."""
+        func_path = os.path.join(self.location, *call_id)
+        if self._item_exists(func_path):
+            self.clear_location(func_path)
+
+    def store_cached_func_code(self, call_id, func_code=None):
+        """Store the code of the cached function."""
+        func_path = os.path.join(self.location, *call_id)
+        if not self._item_exists(func_path):
+            self.create_location(func_path)
+
+        if func_code is not None:
+            filename = os.path.join(func_path, "func_code.py")
+
+            def write_func(to_write, dest_filename):
+                with self._open_item(dest_filename, "wb") as f:
+                    f.write(to_write.encode("utf-8"))
+
+            # Written in place, another process could read it half-written and
+            # take that for a changed function, wiping the cache (#1694)
+            self._concurrency_safe_write(func_code, filename, write_func)
+
+    def get_cached_func_code(self, call_id):
+        """Store the code of the cached function."""
+        filename = os.path.join(self.location, *call_id, "func_code.py")
+        try:
+            with self._open_item(filename, "rb") as f:
+                return f.read().decode("utf-8")
+        except:  # noqa: E722
+            raise
+
+    def get_cached_func_info(self, call_id):
+        """Return information related to the cached function if it exists."""
+        return {"location": os.path.join(self.location, *call_id)}
+
+    def clear(self):
+        """Clear the whole store content."""
+        self.clear_location(self.location)
+
+    def enforce_store_limits(self, bytes_limit, items_limit=None, age_limit=None):
+        """
+        Remove the store's oldest files to enforce item, byte, and age limits.
+        """
+        items_to_delete = self._get_items_to_delete(bytes_limit, items_limit, age_limit)
+
+        for item in items_to_delete:
+            if self.verbose > 10:
+                print("Deleting item {0}".format(item))
+            try:
+                self.clear_location(item.path)
+            except OSError:
+                # Even with ignore_errors=True shutil.rmtree can raise OSError
+                # with:
+                # [Errno 116] Stale file handle if another process has deleted
+                # the folder already.
+                pass
+
+    def _get_items_to_delete(self, bytes_limit, items_limit=None, age_limit=None):
+        """
+        Get items to delete to keep the store under size, file, & age limits.
+        """
+        if isinstance(bytes_limit, str):
+            bytes_limit = memstr_to_bytes(bytes_limit)
+
+        items = self.get_items()
+        if not items:
+            return []
+
+        size = sum(item.size for item in items)
+
+        if bytes_limit is not None:
+            to_delete_size = size - bytes_limit
+        else:
+            to_delete_size = 0
+
+        if items_limit is not None:
+            to_delete_items = len(items) - items_limit
+        else:
+            to_delete_items = 0
+
+        if age_limit is not None:
+            older_item = min(item.last_access for item in items)
+            if age_limit.total_seconds() < 0:
+                raise ValueError("age_limit has to be a positive timedelta")
+            deadline = datetime.datetime.now() - age_limit
+        else:
+            deadline = None
+
+        if (
+            to_delete_size <= 0
+            and to_delete_items <= 0
+            and (deadline is None or older_item > deadline)
+        ):
+            return []
+
+        # We want to delete first the cache items that were accessed a
+        # long time ago
+        items.sort(key=operator.attrgetter("last_access"))
+
+        items_to_delete = []
+        size_so_far = 0
+        items_so_far = 0
+
+        for item in items:
+            if (
+                (size_so_far >= to_delete_size)
+                and items_so_far >= to_delete_items
+                and (deadline is None or deadline < item.last_access)
+            ):
+                break
+
+            items_to_delete.append(item)
+            size_so_far += item.size
+            items_so_far += 1
+
+        return items_to_delete
+
+    def _concurrency_safe_write(self, to_write, filename, write_func):
+        """Writes an object into a file in a concurrency-safe way."""
+
+        # Temporary name is composed of UUID, process_id and thread_id to avoid
+        # collisions due to concurrent write.
+        # UUID is unique across nodes and time and help avoid collisions, even if
+        # the cache folder is shared by several Python processes with the same pid and
+        # thread id on different nodes of a cluster for instance.
+        thread_id = id(threading.current_thread())
+        temporary_filename = f"{filename}.{uuid.uuid4().hex}-{os.getpid()}-{thread_id}"
+
+        try:
+            write_func(to_write, temporary_filename)
+        except BaseException:
+            if self._item_exists(temporary_filename):
+                self._unlink_item(temporary_filename)
+            raise
+        else:
+            self._move_item(temporary_filename, filename)
+
+    def __repr__(self):
+        """Printable representation of the store location."""
+        return '{class_name}(location="{location}")'.format(
+            class_name=self.__class__.__name__, location=self.location
+        )
+
+
+def _check_hex(s, length):
+    if len(s) != length:
+        return False
+    try:
+        if length % 2 == 1:
+            # bytes.fromhex waits for pair sequences
+            s += "0"
+        bytes.fromhex(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _old_split_id(self, call_id):
+    info_path = os.path.join(self.location, "store_backend_info.json")
+    try:
+        with open(info_path, "rb") as file:
+            info = json.loads(file.read().decode("utf-8"))
+        if info["cache_version"] == 2:
+            self._split_id = types.MethodType(FileSystemStoreBackend._split_id, self)
+            return self._split_id(call_id)
+    except OSError:
+        pass
+    return call_id
+
+
+def _reconstructStoreBackend(cls, location, verbose, compress, mmap_mode):
+    obj = cls.__new__(cls)
+    obj.configure(location, verbose, dict(compress=compress, mmap_mode=mmap_mode))
+    return obj
+
+
+def _replace_cache_dir(old_dir, new_dir):
+    """
+    Move an old cache directory to a newer one depending on
+    the last modification time of output.pkl
+    """
+    old_item = os.path.join(old_dir, "output.pkl")
+    try:
+        old_mtime = os.path.getmtime(old_item)
+    except OSError:
+        # "output.pkl" does not exist, so we don't replace
+        shutil.rmtree(old_dir)
+        return
+    new_item = os.path.join(new_dir, "output.pkl")
+    try:
+        new_mtime = os.path.getmtime(new_item)
+    except OSError:
+        new_mtime = -1
+    if new_mtime < old_mtime:
+        # replace
+        shutil.rmtree(new_dir)
+        os.replace(old_dir, new_dir)
+    else:
+        # don't replace
+        shutil.rmtree(old_dir)
+
+
+def _split_decorator(cls):
+    """Helper to split call_id in all relevant class methods.
+
+    Use a decorator as all methods are not implemented directly
+    in this class.
+    """
+
+    def split_method_decorator(method):
+        def split_method(self, call_id, *args, **kwargs):
+            call_id = self._split_id(call_id)
+            return method(self, call_id, *args, **kwargs)
+
+        return split_method
+
+    for method in [
+        "load_item",
+        "dump_item",
+        "clear_item",
+        "contains_item",
+        "get_item_info",
+        "get_metadata",
+        "store_metadata",
+    ]:
+        setattr(cls, method, split_method_decorator(getattr(StoreBackendMixin, method)))
+    return cls
+
+
+@_split_decorator
+class FileSystemStoreBackend(StoreBackendBase, StoreBackendMixin):
+    """A StoreBackend used with local or network file systems."""
+
+    _open_item = staticmethod(open)
+    _item_exists = staticmethod(os.path.exists)
+    _unlink_item = staticmethod(os.unlink)
+    _move_item = staticmethod(concurrency_safe_rename)
+
+    def clear_location(self, location):
+        """Delete location on store."""
+        if location == self.location:
+            rm_subdirs(location)
+        else:
+            shutil.rmtree(location, ignore_errors=True)
+
+    def create_location(self, location):
+        """Create object location on store"""
+        mkdirp(location)
+
+    def get_items(self):
+        """Returns the whole list of items available in the store."""
+        items = []
+
+        for dirpath, _, filenames in os.walk(self.location):
+            parent, basename = os.path.split(dirpath)
+            if not _check_hex(basename, 32):
+                if not _check_hex(basename, 29):
+                    continue
+                if not _check_hex(os.path.basename(parent), 3):
+                    continue
+
+            output_filename = os.path.join(dirpath, "output.pkl")
+            try:
+                last_access = os.path.getatime(output_filename)
+            except OSError:
+                try:
+                    last_access = os.path.getatime(dirpath)
+                except OSError:
+                    # The directory has already been deleted
+                    continue
+
+            last_access = datetime.datetime.fromtimestamp(last_access)
+            try:
+                full_filenames = [os.path.join(dirpath, fn) for fn in filenames]
+                dirsize = sum(os.path.getsize(fn) for fn in full_filenames)
+            except OSError:
+                # Either output_filename or one of the files in
+                # dirpath does not exist any more. We assume this
+                # directory is being cleaned by another process already
+                continue
+
+            items.append(CacheItemInfo(dirpath, dirsize, last_access))
+
+        return items
+
+    def configure(self, location, verbose=1, backend_options=None):
+        """Configure the store backend.
+
+        For this backend, valid store options are 'compress' and 'mmap_mode'
+        """
+        if backend_options is None:
+            backend_options = {}
+
+        # setup location directory
+        self.location = location
+        info = None
+        if not os.path.exists(self.location):
+            mkdirp(self.location)
+            info = {"cache_version": 2, "require_update": False}
+
+        # Get info
+        info_path = os.path.join(self.location, "store_backend_info.json")
+        if os.path.exists(info_path):
+            with open(info_path, "rb") as file:
+                info = json.loads(file.read().decode("utf-8"))
+        else:
+            if info is None:
+                # Cache directory without info.
+                # As long as it has subdirectories,
+                # we consider it uses an old cache tree
+                with os.scandir(self.location) as entries:
+                    for entry in entries:
+                        if entry.is_dir():
+                            info = {"cache_version": 1, "require_update": True}
+                            break
+                if info is None:
+                    info = {"cache_version": 2, "require_update": False}
+            with open(info_path, "wb") as file:
+                file.write(json.dumps(info).encode("utf-8"))
+
+        # Warn if an update is required
+        if info["require_update"]:
+            true_location = (
+                f"'{os.path.dirname(location)}'"
+                if os.path.basename(location) == "joblib"
+                else f"pathlib.Path('{location}')"
+            )
+            warnings.warn(
+                f"The FileSystemStoreBackend at '{self.location}' may contains "
+                "items using old cache storage tree.\n"
+                "The joblib cache tree has recently been updated "
+                "for efficiency reasons.\n"
+                "Starting with joblib 1.9, the old cache tree "
+                "will no longer be supported.\n"
+                f"Please run `joblib.Memory({true_location}).update_cache_tree()` "
+                "to update your cache tree."
+            )
+
+        # Using old split method for older cache version
+        if info["cache_version"] == 1:
+            self._split_id = types.MethodType(_old_split_id, self)
+
+        # Automatically add `.gitignore` file to the cache folder.
+        # XXX: the condition is necessary because in `Memory.__init__`, the user
+        # passed `location` param is modified to be either `{location}` or
+        # `{location}/joblib` depending on input type (`pathlib.Path` vs `str`).
+        # The proper resolution of this inconsistency is tracked in:
+        # https://github.com/joblib/joblib/issues/1684
+        cache_directory = (
+            os.path.dirname(location)
+            if os.path.dirname(location) and os.path.basename(location) == "joblib"
+            else location
+        )
+        gitignore = os.path.join(cache_directory, ".gitignore")
+        if not os.path.exists(gitignore):
+            try:
+                with open(gitignore, "w") as file:
+                    file.write("# Created by joblib automatically.\n")
+                    file.write("*\n")
+            except OSError as e:
+                warnings.warn(f"Unable to write {gitignore}. Exception: {e}.")
+
+        # item can be stored compressed for faster I/O
+        self.compress = backend_options.get("compress", False)
+
+        # FileSystemStoreBackend can be used with mmap_mode options under
+        # certain conditions.
+        mmap_mode = backend_options.get("mmap_mode")
+        if self.compress and mmap_mode is not None:
+            warnings.warn(
+                "Compressed items cannot be memmapped in a "
+                "filesystem store. Option will be ignored.",
+                stacklevel=2,
+            )
+
+        self.mmap_mode = mmap_mode
+        self.verbose = verbose
+
+    def _split_id(self, call_id):
+        if len(call_id) == 0 or not _check_hex(call_id[-1], 32):
+            return call_id
+        return (*call_id[:-1], call_id[-1][:3], call_id[-1][3:])
+
+    # XXX: To remove in joblib 1.9
+    def update_cache_tree(self):
+        # First info update
+        info_path = os.path.join(self.location, "store_backend_info.json")
+        info = {"cache_version": 2, "require_update": True}
+        with open(info_path, "wb") as file:
+            file.write(json.dumps(info).encode("utf-8"))
+
+        # Find old cache directories
+        old_cache = []
+        for dirpath, _, files in os.walk(self.location):
+            if not _check_hex(os.path.basename(dirpath), 32):
+                continue
+            if not (("output.pkl" in files) or ("metadata.json" in files)):
+                continue
+            old_cache.append(dirpath)
+
+        # Replace old cache directories
+        for dirpath in old_cache:
+            parent, basename = os.path.split(dirpath)
+            newdir_parent = os.path.join(parent, basename[:3])
+            newdir = os.path.join(newdir_parent, basename[3:])
+            if os.path.exists(newdir):
+                # If the new cache directory already exists,
+                # it is replaced depending on the last modification time
+                # of 'output.pkl'
+                _replace_cache_dir(dirpath, newdir)
+            else:
+                os.makedirs(newdir_parent, exist_ok=True)
+                os.replace(dirpath, newdir)
+
+        # Second info update
+        info["require_update"] = False
+        with open(info_path, "wb") as file:
+            file.write(json.dumps(info).encode("utf-8"))
+
+    def __reduce__(self):
+        return (
+            _reconstructStoreBackend,
+            (
+                self.__class__,
+                self.location,
+                self.verbose,
+                self.compress,
+                self.mmap_mode,
+            ),
+        )

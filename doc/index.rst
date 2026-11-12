@@ -1,0 +1,71 @@
+:html_theme.sidebar_secondary.remove:
+
+.. container::
+
+   .. image:: _static/joblib_logo.svg
+      :class: only-light
+      :width: 25%
+      :align: center
+
+   .. image:: _static/joblib_logo_dark.svg
+      :class: only-dark
+      :width: 25%
+      :align: center
+
+   .. rubric:: Version |release|
+      :class: center-rubric
+
+Joblib documentation
+====================
+
+.. py:module:: joblib
+
+Joblib is a package for **parallel computing** and **disk-based caching** in Python.
+It is optimized to be **fast** and **robust** on large data in particular
+and has specific optimizations for `numpy` arrays.
+Joblib leaves your code and your flow control as unmodified as possible.
+It is **BSD-licensed**.
+
+.. grid:: 3
+  :gutter: 3
+
+  .. grid-item-card:: Disk-based caching
+    :link: user_guide/memory.html
+
+    Using :class:`~joblib.Memory` for disk-based caching
+
+  .. grid-item-card:: Embarrassingly parallel
+    :link: user_guide/parallel.html
+
+    Using :class:`~joblib.Parallel` for multiprocessing parallel loops
+
+  .. grid-item-card:: Parallel backend
+    :link: user_guide/custom_parallel_backend.html
+
+    Using your own parallel processing backend
+
+  .. grid-item-card:: API
+    :link: references.html
+
+  .. grid-item-card:: Examples
+    :link: auto_examples/index.html
+
+  .. grid-item-card:: Release Notes
+    :link: CHANGES.html
+
+Get Joblib
+----------
+
+Joblib can be installed with ``pip``, as it only relies on python files.
+
+.. code-block:: bash
+
+  pip install joblib
+
+.. toctree::
+  :hidden:
+
+  user_guide/index
+  references
+  ../auto_examples/index
+  developing
