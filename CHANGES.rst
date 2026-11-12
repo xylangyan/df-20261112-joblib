@@ -8,6 +8,13 @@ In Development
    This version changes the way functions defined in jupyter notebook are hashed.
    This invalidates existing cache and will automatically clear them in these cases.
 
+- Add a ``version`` parameter to ``Memory.cache`` (also accepted as a
+  ``version`` keyword on cached calls) so that a data version string
+  participates in the cache identity. This makes it possible to invalidate
+  cached results when an input file is replaced in place while keeping
+  previous versions readable, without adding the version to the cached
+  function's signature.
+
 - Fix hashing of ``frozenset`` to be independent of ``PYTHONHASHSEED``.
   https://github.com/joblib/joblib/pull/1914
 

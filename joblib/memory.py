@@ -156,6 +156,24 @@ def _build_func_identifier(func):
     return os.path.join(*modules, funcname)
 
 
+# Salt mixed with the user-provided data version so that a versioned
+# cache identity can never collide with the hash of the call arguments.
+_VERSION_SALT = "joblib-memory-version-v1"
+
+
+def _version_id(version):
+    """Return a stable identifier for a user-provided data version.
+
+    The identifier only depends on the value of ``version`` (not on the
+    process, the arguments or the function), so the same version value maps
+    to the same cache identity across processes. ``None`` means "no version"
+    and keeps using the historical, unversioned cache entries.
+    """
+    if version is None:
+        return None
+    return hashing.hash((version, _VERSION_SALT))
+
+
 # An in-memory store to avoid looking at the disk-based function
 # source code to check if a function definition has changed
 _FUNCTION_HASHES = weakref.WeakKeyDictionary()
@@ -325,9 +343,11 @@ class NotMemorizedFunc(object):
         self.func = func
 
     def __call__(self, *args, **kwargs):
+        kwargs.pop("version", None)
         return self.func(*args, **kwargs)
 
     def call_and_shelve(self, *args, **kwargs):
+        kwargs.pop("version", None)
         return NotMemorizedResult(self.func(*args, **kwargs))
 
     def __repr__(self):
@@ -338,6 +358,7 @@ class NotMemorizedFunc(object):
         pass
 
     def call(self, *args, **kwargs):
+        kwargs.pop("version", None)
         return self.func(*args, **kwargs), {}
 
     def check_call_in_cache(self, *args, **kwargs):
@@ -349,9 +370,11 @@ class NotMemorizedFunc(object):
 ###############################################################################
 class AsyncNotMemorizedFunc(NotMemorizedFunc):
     async def call(self, *args, **kwargs):
+        kwargs.pop("version", None)
         return await self.func(*args, **kwargs), {}
 
     async def call_and_shelve(self, *args, **kwargs):
+        kwargs.pop("version", None)
         return NotMemorizedResult(await self.func(*args, **kwargs))
 
 
@@ -406,6 +429,14 @@ class MemorizedFunc(Logger):
         the callback is called with the cache entry's metadata as its sole
         argument. If it returns True, the cached result is returned, else the
         cache for these arguments is cleared and the result is recomputed.
+
+    version: str, optional
+        Data version used as part of the cache identity. When it is set,
+        cached results are stored under a dedicated version directory so
+        that changing the underlying data (even when the function arguments
+        are unchanged) leads to a recomputation. The same version string
+        yields the same cache identity across processes. ``None`` (the
+        default) keeps using the historical, unversioned cache entries.
     """
 
     # ------------------------------------------------------------------------
@@ -423,6 +454,7 @@ class MemorizedFunc(Logger):
         verbose=1,
         timestamp=None,
         cache_validation_callback=None,
+        version=None,
     ):
         Logger.__init__(self)
         self.mmap_mode = mmap_mode
@@ -431,6 +463,8 @@ class MemorizedFunc(Logger):
         self.cache_validation_callback = cache_validation_callback
         self.func_id = _build_func_identifier(func)
         self.ignore = ignore if ignore is not None else []
+        self.version = version
+        self._version_id = _version_id(version)
         self._verbose = verbose
 
         # retrieve store object from backend type and location.
@@ -515,8 +549,10 @@ class MemorizedFunc(Logger):
             MemorizedResult reference to the value if shelving is true.
         metadata: dict containing the metadata associated with the call.
         """
+        version = self._pop_version(kwargs)
+        effective_version = self._effective_version(version)
         args_id = self._get_args_id(*args, **kwargs)
-        call_id = (self.func_id, args_id)
+        call_id = self._make_call_id(args_id, version)
         _, func_name = get_func_name(self.func)
         func_info = self.store_backend.get_cached_func_info([self.func_id])
         location = func_info["location"]
@@ -530,7 +566,7 @@ class MemorizedFunc(Logger):
                         Querying {func_name} with signature
                         {signature}.
 
-                        (argument hash {args_id})
+                        (argument hash {args_id}, version {effective_version!r})
 
                         The store location is {location}.
                         """
@@ -568,7 +604,13 @@ class MemorizedFunc(Logger):
             )
 
         # Returns the output but not the metadata
-        return self._call(call_id, args, kwargs, shelving)
+        return self._call(
+            call_id,
+            args,
+            kwargs,
+            shelving,
+            version=self._effective_version(version),
+        )
 
     @property
     def func_code_info(self):
@@ -600,6 +642,11 @@ class MemorizedFunc(Logger):
         result itself. The reference object is small and picklable, allowing
         to send or store it easily. Call .get() on reference object to get
         result.
+
+        A ``version`` keyword can be passed to select (or create) the cache
+        generation of the given data version. It is consumed by the cache and
+        is never forwarded to the wrapped function. See the ``version``
+        parameter of ``Memory.cache`` for details.
 
         Returns
         -------
@@ -647,7 +694,9 @@ class MemorizedFunc(Logger):
         is_call_in_cache: bool
             Whether or not the function call is in cache and can be used.
         """
-        call_id = (self.func_id, self._get_args_id(*args, **kwargs))
+        version = self._pop_version(kwargs)
+        args_id = self._get_args_id(*args, **kwargs)
+        call_id = self._make_call_id(args_id, version)
         return self._is_in_cache_and_valid(call_id)
 
     # ------------------------------------------------------------------------
@@ -660,6 +709,43 @@ class MemorizedFunc(Logger):
             filter_args(self.func, self.ignore, args, kwargs),
             coerce_mmap=self.mmap_mode is not None,
         )
+
+    def _pop_version(self, kwargs):
+        """Extract the per-call ``version`` keyword from the call kwargs.
+
+        The version is consumed by the cache and is never forwarded to the
+        wrapped function.
+        """
+        return kwargs.pop("version", None)
+
+    def _effective_version(self, version):
+        """Resolve the version actually used for a call.
+
+        A version given at call time overrides the one set when the function
+        was cached. When no version is given at call time (``None``), the
+        version declared with ``Memory.cache`` (possibly itself ``None``) is
+        used, so that a versioned decorator stays versioned by default.
+        """
+        if version is None:
+            return self.version
+        return version
+
+    def _make_call_id(self, args_id, version):
+        """Build the cache identity for a call.
+
+        The version, when one is effective, is inserted between the function
+        identifier and the argument hash. Without a version the historical
+        ``(func_id, args_id)`` identity is kept so that old cache entries
+        remain reachable.
+        """
+        version = self._effective_version(version)
+        if version is None:
+            return (self.func_id, args_id)
+        if version == self.version:
+            version_id = self._version_id
+        else:
+            version_id = _version_id(version)
+        return (self.func_id, version_id, args_id)
 
     def _hash_func(self):
         """Hash a function to key the online cache"""
@@ -795,7 +881,11 @@ class MemorizedFunc(Logger):
         return False
 
     def clear(self, warn=True):
-        """Empty the function's cache."""
+        """Empty the function's cache.
+
+        This wipes every cached result of the function, including all data
+        versions. Use ``Memory.clear`` to flush the whole store instead.
+        """
         func_id = self.func_id
         if self._verbose > 0 and warn:
             self.warn("Clearing function cache identified by %s" % func_id)
@@ -814,6 +904,10 @@ class MemorizedFunc(Logger):
         The output values will be persisted, i.e., the cache will be updated
         with any new values.
 
+        A ``version`` keyword can be passed to select (or create) the cache
+        generation of the given data version. It is consumed by the cache and
+        is never forwarded to the wrapped function.
+
         Parameters
         ----------
         *args: arguments
@@ -828,32 +922,40 @@ class MemorizedFunc(Logger):
         metadata : dict
             The metadata associated with the call.
         """
-        call_id = (self.func_id, self._get_args_id(*args, **kwargs))
+        version = self._pop_version(kwargs)
+        effective_version = self._effective_version(version)
+        call_id = self._make_call_id(self._get_args_id(*args, **kwargs), version)
 
         # Register the function code and invalidate old results before saving
         # the new result, even when this is the first call.
         self._check_previous_func_code(stacklevel=3)
 
         # Return the output and the metadata
-        return self._call(call_id, args, kwargs)
+        return self._call(call_id, args, kwargs, version=effective_version)
 
-    def _call(self, call_id, args, kwargs, shelving=False):
+    def _call(self, call_id, args, kwargs, shelving=False, version=None):
         # Return the output and the metadata
         self._before_call(args, kwargs)
         start_time = time.time()
         output = self.func(*args, **kwargs)
-        return self._after_call(call_id, args, kwargs, shelving, output, start_time)
+        return self._after_call(
+            call_id, args, kwargs, shelving, output, start_time, version=version
+        )
 
     def _before_call(self, args, kwargs):
         if self._verbose > 0:
             print(format_call(self.func, args, kwargs))
 
-    def _after_call(self, call_id, args, kwargs, shelving, output, start_time):
+    def _after_call(
+        self, call_id, args, kwargs, shelving, output, start_time, version=None
+    ):
         self.store_backend.dump_item(call_id, output, verbose=self._verbose)
         duration = time.time() - start_time
         if self._verbose > 0:
             self._print_duration(duration)
-        metadata = self._persist_input(duration, call_id, args, kwargs)
+        metadata = self._persist_input(
+            duration, call_id, args, kwargs, version=version
+        )
         if shelving:
             return self._get_memorized_result(call_id, metadata), metadata
 
@@ -863,7 +965,15 @@ class MemorizedFunc(Logger):
             output = self._load_item(call_id, metadata)
         return output, metadata
 
-    def _persist_input(self, duration, call_id, args, kwargs, this_duration_limit=0.5):
+    def _persist_input(
+        self,
+        duration,
+        call_id,
+        args,
+        kwargs,
+        this_duration_limit=0.5,
+        version=None,
+    ):
         """Save a small summary of the call using json format in the
         output directory.
 
@@ -879,6 +989,10 @@ class MemorizedFunc(Logger):
 
         this_duration_limit: float
             Max execution time for this function before issuing a warning.
+
+        version: object
+            data version associated with the call, stored in the metadata
+            when it is not None.
         """
         start_time = time.time()
         argument_dict = filter_args(self.func, self.ignore, args, kwargs)
@@ -891,6 +1005,8 @@ class MemorizedFunc(Logger):
             "input_args": input_repr,
             "time": start_time,
         }
+        if version is not None:
+            metadata["version"] = version
 
         self.store_backend.store_metadata(call_id, metadata)
 
@@ -962,11 +1078,13 @@ class AsyncMemorizedFunc(MemorizedFunc):
         out = super().call(*args, **kwargs)
         return await out if asyncio.iscoroutine(out) else out
 
-    async def _call(self, call_id, args, kwargs, shelving=False):
+    async def _call(self, call_id, args, kwargs, shelving=False, version=None):
         self._before_call(args, kwargs)
         start_time = time.time()
         output = await self.func(*args, **kwargs)
-        return self._after_call(call_id, args, kwargs, shelving, output, start_time)
+        return self._after_call(
+            call_id, args, kwargs, shelving, output, start_time, version=version
+        )
 
 
 ###############################################################################
@@ -1064,6 +1182,7 @@ class Memory(Logger):
         verbose=None,
         mmap_mode=False,
         cache_validation_callback=None,
+        version=None,
     ):
         """Decorates the given function func to only compute its return
         value for input arguments not cached on disk.
@@ -1088,6 +1207,18 @@ class Memory(Logger):
             result as its sole argument. If it returns True, then the
             cached result is returned, else the cache for these arguments
             is cleared and recomputed.
+        version: str, optional
+            Data version used as part of the cache identity. Set it when the
+            data read by the wrapped function (for instance a file whose
+            content is replaced in place) changes without any change of the
+            function arguments. Results are stored under a dedicated version
+            directory: the same version string always yields the same cache
+            identity, including across processes, while switching version
+            triggers a recomputation without deleting the cache of other
+            versions. A ``version`` keyword passed at call time overrides the
+            one given here; when no version is passed at call time, the
+            version declared here is used. ``None`` (the default) keeps using
+            the historical, unversioned cache entries.
 
         Returns
         -------
@@ -1113,6 +1244,7 @@ class Memory(Logger):
                 mmap_mode=mmap_mode,
                 verbose=verbose,
                 cache_validation_callback=cache_validation_callback,
+                version=version,
             )
         if self.store_backend is None:
             cls = (
@@ -1156,6 +1288,7 @@ class Memory(Logger):
             verbose=verbose,
             timestamp=self.timestamp,
             cache_validation_callback=cache_validation_callback,
+            version=version,
         )
 
     def clear(self, warn=True):

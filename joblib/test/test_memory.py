@@ -1684,6 +1684,260 @@ def test_info_log(tmpdir, caplog):
     caplog.clear()
 
 
+class TestMemoryVersion:
+    "Tests on the `version` parameter of Memory.cache and of cached calls"
+
+    def test_version_recomputes_and_keeps_old_generations(self, tmpdir):
+        # Same arguments, new data version -> recompute; the cache of the
+        # previous version is kept and can be read back without recomputing.
+        accumulator = []
+
+        def f(x):
+            accumulator.append(1)
+            return x
+
+        memory = Memory(location=tmpdir.strpath, verbose=0)
+        g = memory.cache(f, version="v1")
+        assert g(1) == 1
+        assert g(1) == 1
+        assert len(accumulator) == 1
+
+        # Switching the version recomputes...
+        assert g(1, version="v2") == 1
+        assert len(accumulator) == 2
+        # ... and the new version is cached on its own
+        assert g(1, version="v2") == 1
+        assert len(accumulator) == 2
+        # The v1 entry is still there: reading it back does not recompute
+        assert g(1, version="v1") == 1
+        assert len(accumulator) == 2
+
+    def test_version_at_call_time_only(self, tmpdir):
+        # version can be given per call without declaring it in cache()
+        accumulator = []
+
+        def f(x):
+            accumulator.append(1)
+            return x
+
+        memory = Memory(location=tmpdir.strpath, verbose=0)
+        g = memory.cache(f)
+        assert g(1, version="v1") == 1
+        assert g(1, version="v1") == 1
+        assert g(1, version="v2") == 1
+        assert len(accumulator) == 2
+
+    def test_version_not_forwarded_to_func(self, tmpdir):
+        # The version keyword is consumed by the cache and never reaches
+        # the wrapped function (which takes no such parameter).
+        def f(x):
+            return x
+
+        memory = Memory(location=tmpdir.strpath, verbose=0)
+        g = memory.cache(f, version="v1")
+        assert g(1) == 1
+        assert g(1, version="v2") == 1
+
+    def test_unversioned_entries_keep_legacy_identity(self, tmpdir):
+        # Entries written without a version stay at the historical location
+        # and remain readable; versioned and unversioned entries coexist.
+        accumulator = []
+
+        def f(x):
+            accumulator.append(1)
+            return x
+
+        memory = Memory(location=tmpdir.strpath, verbose=0)
+        g = memory.cache(f)
+        assert g(1) == 1
+        assert len(accumulator) == 1
+
+        gv = memory.cache(f, version="v1")
+        assert gv(1) == 1
+        assert len(accumulator) == 2
+
+        # The unversioned entry is still a hit, untouched by the versioned
+        # calls.
+        assert g(1) == 1
+        assert len(accumulator) == 2
+
+        # On-disk layout: the unversioned item sits directly under the
+        # function directory, with no version directory in between.
+        args_id = g._get_args_id(1)
+        legacy_path = os.path.join(
+            g.store_backend.location,
+            *g.store_backend._split_id((g.func_id, args_id)),
+        )
+        assert os.path.exists(os.path.join(legacy_path, "output.pkl"))
+
+    def test_version_stable_across_memory_instances(self, tmpdir):
+        # The same version string maps to the same cache identity, even for
+        # a fresh Memory object (as in another process).
+        accumulator = []
+
+        def f(x):
+            accumulator.append(1)
+            return x
+
+        g1 = Memory(location=tmpdir.strpath, verbose=0).cache(f, version="v1")
+        assert g1(1) == 1
+        g2 = Memory(location=tmpdir.strpath, verbose=0).cache(f, version="v1")
+        assert g2(1) == 1
+        assert len(accumulator) == 1
+
+    def test_version_identity_shared_across_processes(self, tmpdir):
+        # The same version string yields the same cache identity in another
+        # process: a second interpreter reuses the cache and does not
+        # recompute.
+        location = tmpdir.join("cache").strpath
+        witness = tmpdir.join("witness").strpath
+        module = tmpdir.join("versioned_module.py")
+        module.write(
+            "WITNESS = {0!r}\n"
+            "def convert(x):\n"
+            "    with open(WITNESS, 'a') as f:\n"
+            "        f.write('computed\\n')\n"
+            "    return x * 2\n".format(witness)
+        )
+        script = (
+            "import sys; sys.path.insert(0, {0!r});"
+            "from joblib import Memory;"
+            "import versioned_module;"
+            "memory = Memory({1!r}, verbose=0);"
+            "convert = memory.cache(versioned_module.convert, version='v1');"
+            "assert convert(21) == 42".format(tmpdir.strpath, location)
+        )
+
+        for _ in range(2):
+            p = subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True,
+                text=True,
+            )
+            assert p.returncode == 0, p.stderr
+
+        with open(witness) as fh:
+            assert fh.read().count("computed") == 1
+
+    def test_version_with_decorator_partial_form(self, tmpdir):
+        # @memory.cache(version=...) used as a decorator factory
+        accumulator = []
+        memory = Memory(location=tmpdir.strpath, verbose=0)
+
+        @memory.cache(version="v1")
+        def f(x):
+            accumulator.append(1)
+            return x
+
+        assert f(1) == 1
+        assert f(1) == 1
+        assert len(accumulator) == 1
+        assert f(1, version="v2") == 1
+        assert len(accumulator) == 2
+
+    def test_version_kwargs_swallowed_without_cache(self):
+        # With location=None, caching is disabled but the version keyword
+        # must still be accepted and not forwarded to the wrapped function.
+        memory = Memory(location=None, verbose=0)
+        g = memory.cache(f, version="v1")
+        assert g(2, version="v2") == 5
+        assert g.call(2, version="v2")[0] == 5
+        assert g.call_and_shelve(2, version="v2").get() == 5
+
+    def test_version_with_ignore_and_default_args(self, tmpdir):
+        # version composes with ignore and default-argument normalization
+        accumulator = []
+
+        def f(x, y=1, ignored=None):
+            accumulator.append(1)
+            return x + y
+
+        memory = Memory(location=tmpdir.strpath, verbose=0)
+        g = memory.cache(f, ignore=["ignored"], version="v1")
+        assert g(1, ignored="a") == 2
+        # default argument normalization and ignore still apply
+        assert g(1, y=1, ignored="b") == 2
+        assert len(accumulator) == 1
+        # a new version recomputes with the same normalized arguments
+        assert g(1, ignored="a", version="v2") == 2
+        assert len(accumulator) == 2
+
+    def test_check_call_in_cache_with_version(self, tmpdir):
+        memory = Memory(location=tmpdir.strpath, verbose=0)
+        g = memory.cache(f, version="v1")
+        assert not g.check_call_in_cache(2)
+        g(2)
+        assert g.check_call_in_cache(2)
+        assert g.check_call_in_cache(2, version="v1")
+        assert not g.check_call_in_cache(2, version="v2")
+        # version=None at call time falls back to the declared version
+        assert g.check_call_in_cache(2, version=None)
+        # the unversioned identity is a different entry
+        g_unversioned = memory.cache(f)
+        assert not g_unversioned.check_call_in_cache(2)
+
+    def test_call_and_shelve_with_version(self, tmpdir):
+        memory = Memory(location=tmpdir.strpath, verbose=0)
+        g = memory.cache(f, version="v1")
+        result_v1 = g.call_and_shelve(2)
+        assert isinstance(result_v1, MemorizedResult)
+        assert result_v1.get() == 5
+
+        result_v2 = g.call_and_shelve(2, version="v2")
+        assert result_v2.get() == 5
+        # The two references point to different cache identities
+        assert result_v1._call_id != result_v2._call_id
+
+        # Clearing the v2 reference does not touch the v1 entry
+        result_v2.clear()
+        with raises(KeyError):
+            result_v2.get()
+        assert result_v1.get() == 5
+
+    def test_call_metadata_records_version(self, tmpdir):
+        memory = Memory(location=tmpdir.strpath, verbose=0)
+        g = memory.cache(f, version="v1")
+        _, metadata = g.call(2)
+        assert metadata["version"] == "v1"
+        _, metadata = g.call(2, version="v2")
+        assert metadata["version"] == "v2"
+        # unversioned calls record no version
+        g_unversioned = memory.cache(f)
+        _, metadata = g_unversioned.call(2)
+        assert "version" not in metadata
+
+    def test_clear_removes_all_versions(self, tmpdir):
+        memory = Memory(location=tmpdir.strpath, verbose=0)
+        g = memory.cache(f, version="v1")
+        g(1)
+        g(1, version="v2")
+        g(1, version="v3")
+        assert len(memory.store_backend.get_items()) == 3
+        g.clear(warn=False)
+        assert memory.store_backend.get_items() == []
+
+    def test_reduce_size_with_versions(self, tmpdir):
+        # Version directories are not mistaken for cache items: only actual
+        # item directories are reported and deleted.
+        memory = Memory(location=tmpdir.strpath, verbose=0)
+        g = memory.cache(f, version="v1")
+        g(1)
+        g(2, version="v2")
+        g(3, version=None)
+        items = memory.store_backend.get_items()
+        assert len(items) == 3
+        for item in items:
+            assert os.path.exists(os.path.join(item.path, "output.pkl"))
+
+        # A generous limit keeps everything
+        memory.reduce_size(bytes_limit="1M")
+        assert len(memory.store_backend.get_items()) == 3
+
+        # A zero age limit deletes every item, versioned or not
+        memory.reduce_size(age_limit=datetime.timedelta(seconds=0))
+        assert memory.store_backend.get_items() == []
+
+
 class TestCacheValidationCallback:
     "Tests on parameter `cache_validation_callback`"
 

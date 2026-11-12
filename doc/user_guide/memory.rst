@@ -462,6 +462,61 @@ list::
     >>> # my_func was not reevaluated
 
 
+Versioning cached data
+----------------------
+
+Sometimes a cached function reads from an external resource (a file, a
+database table, ...) whose content changes while the function arguments stay
+the same. Passing the resource itself as an argument is not always possible,
+for instance when the function only takes a filename that another job
+replaces in place. In that case, the cache cannot notice the change and keeps
+returning the stale result.
+
+The ``version`` parameter of :meth:`Memory.cache` lets a data version string
+take part in the cache identity, without adding it to the signature of the
+cached function::
+
+    >>> @memory.cache(version='v1')
+    ... def process(filename):
+    ...     with open(filename) as f:
+    ...         return f.read().upper()
+
+The version can also be given (or overridden) at call time with the
+``version`` keyword. This keyword is consumed by the cache and is never
+forwarded to the wrapped function::
+
+    >>> process('data.txt', version='v2')  # recomputed under the v2 identity
+
+The version is hashed into a stable identifier, so the same version string
+always yields the same cache identity, including across processes. Results
+of the different versions are stored side by side: switching version
+triggers a recomputation, but previous generations are not deleted and can
+still be read back explicitly (for instance for replay or comparison)::
+
+    >>> process('data.txt', version='v1')  # cache hit on the old generation
+
+When no version is given (the default), :class:`Memory` uses the historical,
+unversioned cache entries, so caches created by older versions of joblib
+remain readable. The version directory also contains the version value in the
+``metadata.json`` file of each call.
+
+The version mechanism composes with the other cache options:
+
+- ``ignore`` and the default-argument normalization apply exactly as usual;
+  the version only adds a level to the cache identity.
+- :meth:`MemorizedFunc.clear` and :meth:`Memory.clear` remove **all**
+  versions. Switching version never deletes another version.
+- :meth:`Memory.reduce_size` applies item by item to every version while
+  keeping the version generations themselves intact.
+- :meth:`MemorizedFunc.call_and_shelve` returns a reference scoped to the
+  version used for the call, and references from different versions point to
+  independent entries.
+
+See the example
+:ref:`sphx_glr_auto_examples_memory_data_versioning.py` for a runnable
+demonstration with a call counter.
+
+
 Custom cache validation
 -----------------------
 

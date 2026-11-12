@@ -535,6 +535,12 @@ class FileSystemStoreBackend(StoreBackendBase, StoreBackendMixin):
                     continue
                 if not _check_hex(os.path.basename(parent), 3):
                     continue
+            elif not (("output.pkl" in filenames) or ("metadata.json" in filenames)):
+                # A 32-character hexadecimal directory that does not directly
+                # contain a cached item is a data-version directory holding
+                # versioned items. Do not report it as an item: deleting it
+                # would wipe a whole version generation at once.
+                continue
 
             output_filename = os.path.join(dirpath, "output.pkl")
             try:
