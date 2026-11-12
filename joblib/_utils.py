@@ -125,10 +125,19 @@ class _Sentinel:
 class _TracebackCapturingWrapper:
     """Protect function call and return error with traceback."""
 
-    def __init__(self, func):
+    def __init__(self, func, is_aborted=None):
         self.func = func
+        self.is_aborted = is_aborted
 
     def __call__(self, **kwargs):
+        # When the output generator is closed before full consumption, tasks
+        # that were queued but not yet started must be skipped as soon as a
+        # worker picks them up, so that they cannot occupy the pool while the
+        # backend is reused for another Parallel call. The check is based on
+        # the immutable call id captured at submission time rather than on a
+        # mutable abort flag, which a subsequent call would reset.
+        if self.is_aborted is not None and self.is_aborted():
+            return None
         try:
             return self.func(**kwargs)
         except BaseException as e:

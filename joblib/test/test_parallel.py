@@ -1836,6 +1836,165 @@ def test_multiple_generator_call_separated_gc(backend, return_as_1, return_as_2,
         assert parallel._aborting
 
 
+def _event_gated_task(event, events_log, round_id, task_id):
+    """Threading-backend task whose blocking is controlled by an Event."""
+    events_log.append(("start", round_id, task_id))
+    event.wait()
+    events_log.append(("end", round_id, task_id))
+    return (round_id, task_id)
+
+
+@parametrize("return_as", ["generator", "generator_unordered"])
+def test_generator_early_close_cancels_pending_threading_tasks(return_as):
+    # A generator closed before full consumption must skip the tasks that
+    # have not started yet, while the running tasks are left to finish
+    # (threads cannot be killed).
+    n_jobs = 2
+    block_event = threading.Event()
+    events_log = []
+
+    with Parallel(
+        n_jobs=n_jobs,
+        backend="threading",
+        return_as=return_as,
+        pre_dispatch="all",
+    ) as parallel:
+        # Every task except the first one blocks: A1 and A2 occupy the two
+        # workers deterministically, leaving A3..A5 queued and unable to run
+        # before the generator is closed.
+        generator = parallel(
+            delayed(_event_gated_task)(
+                block_event if i > 0 else _UnblockedEvent(), events_log, "A", i
+            )
+            for i in range(6)
+        )
+
+        assert next(generator) == ("A", 0)
+        with pytest.warns(UserWarning, match="cancelled"):
+            generator.close()
+
+        # Only the first task and the tasks the two workers picked up before
+        # the close can start: A4 and A5 must still be queued since both
+        # workers are blocked, and they are skipped by the wrapper installed
+        # in ThreadingBackend.submit when they finally reach a worker.
+        started = {
+            (round_id, task_id)
+            for event_name, round_id, task_id in events_log
+            if event_name == "start"
+        }
+        assert ("A", 0) in started
+        assert not started.intersection({("A", 4), ("A", 5)})
+
+        # Free the still running tasks. The backend must accept a new call
+        # right away and that call must only see its own results.
+        block_event.set()
+        second_results = list(
+            parallel(
+                delayed(_event_gated_task)(
+                    _UnblockedEvent(), events_log, "B", i
+                )
+                for i in range(2)
+            )
+        )
+        assert sorted(second_results) == [("B", 0), ("B", 1)]
+
+
+@parametrize("return_as", ["generator", "generator_unordered"])
+def test_generator_early_close_keeps_full_consumption_behavior(return_as):
+    # Fully consuming the generator must not emit the early-close warning
+    # and must return every result, regardless of the return ordering.
+    n_inputs = 6
+    block_event = threading.Event()
+    events_log = []
+
+    with Parallel(
+        n_jobs=2, backend="threading", return_as=return_as, pre_dispatch="all"
+    ) as parallel:
+        generator = parallel(
+            delayed(_event_gated_task)(
+                block_event if i > 0 else _UnblockedEvent(), events_log, "A", i
+            )
+            for i in range(n_inputs)
+        )
+
+        block_event.set()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            results = list(generator)
+
+    assert sorted(results) == [("A", i) for i in range(n_inputs)]
+    assert len(events_log) == 2 * n_inputs
+
+
+def test_generator_early_close_isolates_subsequent_exceptions():
+    # An exception in the call following an early close must surface as the
+    # only error of the second call, without any leftover state from the
+    # first one.
+    n_jobs = 2
+    block_event = threading.Event()
+    events_log = []
+
+    with Parallel(
+        n_jobs=n_jobs,
+        backend="threading",
+        return_as="generator",
+        pre_dispatch="all",
+    ) as parallel:
+        generator = parallel(
+            delayed(_event_gated_task)(
+                block_event if i > 0 else _UnblockedEvent(), events_log, "A", i
+            )
+            for i in range(4)
+        )
+        assert next(generator) == ("A", 0)
+        with pytest.warns(UserWarning):
+            generator.close()
+
+        block_event.set()
+
+        second_generator = parallel(
+            delayed(_failing_task)(i) for i in range(3)
+        )
+        with raises(TypeError, match="scheduled failure"):
+            list(second_generator)
+
+        # A subsequent, healthy call on the same backend still works.
+        third_results = parallel(delayed(sqrt)(i**2) for i in range(3))
+        assert list(third_results) == [0.0, 1.0, 2.0]
+
+
+class _UnblockedEvent:
+    """Event-like object that never blocks, for the fast first task."""
+
+    def wait(self, timeout=None):
+        return True
+
+
+def _failing_task(i):
+    raise TypeError(f"scheduled failure {i}")
+
+
+@with_multiprocessing
+@parametrize("return_as", ["generator", "generator_unordered"])
+def test_generator_early_close_reuses_process_backend(return_as):
+    # Backends that cannot distinguish queued from running tasks (the
+    # process-based backends) fall back to aborting everything and must still
+    # leave a working backend behind for the next call, which only sees its
+    # own results.
+    parallel = Parallel(n_jobs=2, backend="loky", return_as=return_as)
+    generator = parallel(delayed(sleep)(5) for _ in range(6))
+    next(generator)
+    t_start = time.time()
+    with pytest.warns(UserWarning):
+        generator.close()
+
+    second = Parallel(n_jobs=2, backend="loky", return_as=return_as)(
+        delayed(sqrt)(i**2) for i in range(4)
+    )
+    assert sorted(second) == [0.0, 1.0, 2.0, 3.0]
+    assert time.time() - t_start < 5
+
+
 @with_numpy
 @with_multiprocessing
 @parametrize("backend", PROCESS_BACKENDS)

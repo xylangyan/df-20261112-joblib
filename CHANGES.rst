@@ -8,6 +8,19 @@ In Development
    This version changes the way functions defined in jupyter notebook are hashed.
    This invalidates existing cache and will automatically clear them in these cases.
 
+- Closing the generator returned by ``Parallel(return_as='generator')`` or
+  ``Parallel(return_as='generator_unordered')`` before full consumption now
+  cancels only the tasks that have not started yet when the backend supports
+  it (``threading``, ``dask``), instead of tearing down the whole worker
+  pool. Tasks already running are left to finish according to the backend
+  capabilities and the backend is kept ready for the next call, so reusing
+  the same backend right after an early close does not wait on the previous
+  call's slow tasks. The batches prefetched for the aborted call are also
+  discarded, so the next call on the same ``Parallel`` instance only sees
+  its own results and exceptions. Finally, the early-close warning now points
+  at the user call site that closed the generator instead of an internal
+  frame.
+
 - Fix hashing of ``frozenset`` to be independent of ``PYTHONHASHSEED``.
   https://github.com/joblib/joblib/pull/1914
 

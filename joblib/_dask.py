@@ -357,10 +357,19 @@ class DaskDistributedBackend(AutoBatchingMixin, ParallelBackendBase):
 
         joblib.Parallel will never access those results
         """
+        self.abort_pending_tasks()
+
+    def abort_pending_tasks(self):
+        """Drop the futures of the tasks that have not been collected yet.
+
+        Already running dask tasks cannot be interrupted this way and are
+        left to finish, while the client stays ready for the next call.
+        """
         with self.waiting_futures.lock:
             self.waiting_futures.futures.clear()
             while not self.waiting_futures.queue.empty():
                 self.waiting_futures.queue.get()
+        return True
 
     @contextlib.contextmanager
     def retrieval_context(self):

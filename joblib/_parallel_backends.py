@@ -282,6 +282,23 @@ class ParallelBackendBase(metaclass=ABCMeta):
         # canceling tasks is possible.
         pass
 
+    def abort_pending_tasks(self):
+        """Cancel the tasks that have not started running yet.
+
+        This is called when the generator returned by a Parallel call is
+        closed before being fully consumed. Backends able to distinguish
+        queued tasks from running tasks should cancel only the former and let
+        the running tasks finish (they cannot be interrupted safely), while
+        keeping the backend ready to accept tasks from the next Parallel
+        call.
+
+        Return True if the backend supports this soft cancellation, False if
+        it does not and the caller has to fall back to `abort_everything`.
+        """
+        # Does nothing by default: to be overridden in subclasses when
+        # canceling pending tasks is possible.
+        return False
+
     def get_nested_backend(self):
         """Backend instance to be used by nested Parallel calls.
 
@@ -597,6 +614,41 @@ class ThreadingBackend(PoolManagerMixin, ParallelBackendBase):
                 initializer=lambda: set_thread_local_cpu_limit(cores_per_thread),
             )
         return self._pool
+
+    def submit(self, func, callback=None):
+        """Schedule a func to be run.
+
+        The callable is wrapped so that, if the generator driving this call
+        is closed before full consumption, a worker picking up a not yet
+        started task skips it instead of running it. This keeps the pool
+        immediately available for the next Parallel call.
+        """
+        parallel = self.parallel
+        # Capture the call id at submission time: a later call resets the
+        # abort flags, so the check must identify this specific call as
+        # aborted instead of reading the mutable flag directly.
+        submitted_call_id = parallel._call_id
+
+        def is_aborted():
+            return parallel._call_id != submitted_call_id or parallel._aborting
+
+        wrapped_func = _TracebackCapturingWrapper(func, is_aborted=is_aborted)
+        return self._get_pool().apply_async(
+            wrapped_func, (), callback=callback, error_callback=callback
+        )
+
+    def abort_pending_tasks(self):
+        """Let the queued tasks be skipped when a worker picks them up.
+
+        Threads cannot be killed, so tasks already running are left to finish
+        on their own. The pool's internal queues must not be drained
+        directly: that would desynchronize the worker tasks from their
+        ApplyResult bookkeeping and return stale results to the next call.
+        Instead, the wrapper installed in `submit` checks the abort state and
+        short-circuits any task that had not started yet. The pool itself is
+        kept alive and stays reusable by the next Parallel call.
+        """
+        return True
 
 
 @dataclass

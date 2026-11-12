@@ -1378,7 +1378,7 @@ class Parallel(Logger):
     def __exit__(self, exc_type, exc_value, traceback):
         self._managed_backend = False
         if self.return_generator and self._calling:
-            self._abort()
+            self._abort(soft=True)
         self._terminate_and_reset()
 
     def _initialize_backend(self):
@@ -1444,6 +1444,17 @@ class Parallel(Logger):
 
         job = self._backend.submit(batch, callback=batch_tracker)
         batch_tracker.register_job(job)
+
+    def _drain_ready_batches(self):
+        """Discard the batches prefetched for a call that did not consume them."""
+        ready_batches = getattr(self, "_ready_batches", None)
+        if ready_batches is None:
+            return
+        while True:
+            try:
+                ready_batches.get(block=False)
+            except queue.Empty:
+                break
 
     def _register_new_job(self, batch_tracker):
         if self.return_ordered:
@@ -1637,7 +1648,7 @@ class Parallel(Logger):
                 f"{short_format_time(remaining_time)}"
             )
 
-    def _abort(self):
+    def _abort(self, soft=False):
         # Stop dispatching new jobs in the async callback thread
         self._aborting = True
 
@@ -1646,12 +1657,21 @@ class Parallel(Logger):
         # the exception we got back to the caller instead of returning
         # any result.
         backend = self._backend
-        if not self._aborted and hasattr(backend, "abort_everything"):
-            # If the backend is managed externally we need to make sure
-            # to leave it in a working state to allow for future jobs
-            # scheduling.
-            ensure_ready = self._managed_backend
-            backend.abort_everything(ensure_ready=ensure_ready)
+        if not self._aborted:
+            # A soft abort happens when the output generator is closed
+            # before being fully consumed. Backends that support it only
+            # cancel the tasks waiting to start and let the already running
+            # tasks finish, keeping the backend ready for the next call.
+            if soft and hasattr(backend, "abort_pending_tasks"):
+                soft_cancelled = backend.abort_pending_tasks()
+            else:
+                soft_cancelled = False
+            if not soft_cancelled and hasattr(backend, "abort_everything"):
+                # If the backend is managed externally we need to make sure
+                # to leave it in a working state to allow for future jobs
+                # scheduling.
+                ensure_ready = self._managed_backend
+                backend.abort_everything(ensure_ready=ensure_ready)
         self._aborted = True
 
     def _start(self, iterator, pre_dispatch):
@@ -1695,6 +1715,12 @@ class Parallel(Logger):
             # the user if necessary.
             self._exception = True
 
+            # Drop the iterators first so a late completion callback cannot
+            # dispatch the remaining input of this call once a new call has
+            # started and reset the abort flags on the same instance.
+            self._iterating = False
+            self._original_iterator = None
+
             # In some interpreters such as PyPy, GeneratorExit can be raised in
             # a different thread than the one used to start the dispatch of the
             # parallel tasks. This can lead to hang when a thread attempts to
@@ -1717,7 +1743,7 @@ class Parallel(Logger):
 
                 class _GeneratorExitThread(threading.Thread):
                     def run(self):
-                        _parallel._abort()
+                        _parallel._abort(soft=True)
                         if _parallel.return_generator:
                             _parallel._warn_exit_early()
                         _parallel._terminate_and_reset()
@@ -1727,7 +1753,7 @@ class Parallel(Logger):
 
             # Otherwise, we are in the thread that started the dispatch: we can
             # safely abort the execution and warn the user.
-            self._abort()
+            self._abort(soft=True)
             if self.return_generator:
                 self._warn_exit_early()
 
@@ -1895,7 +1921,10 @@ class Parallel(Logger):
                 "iterator to limit unnecessary computation time."
             )
 
-            warnings.warn(msg)
+            # stacklevel=3 points at the `gen.close()` / generator drop call
+            # site instead of the internal generator-exit handling frames, so
+            # the warning can be located in user code.
+            warnings.warn(msg, stacklevel=3)
 
     def _get_sequential_output(self, iterable):
         """Separate loop for sequential output.
@@ -1955,11 +1984,21 @@ class Parallel(Logger):
                     )
                 raise RuntimeError(msg)
             self._running = True
+            # Assign the new call id before resetting any other flag: a task
+            # queued for a previous call checks it to detect that its call is
+            # over, so it must never see a half-reset state where the abort
+            # flags are already cleared but the call id is still the old one.
+            self._call_id = uuid4().hex
 
         # Counter to keep track of the task dispatched and completed.
         self.n_dispatched_batches = 0
         self.n_dispatched_tasks = 0
         self.n_completed_tasks = 0
+
+        # Drop the tasks prefetched for a previous call but not dispatched
+        # yet (e.g. after an early generator close), so they cannot leak into
+        # the outputs of the new call reusing the same instance.
+        self._drain_ready_batches()
 
         # Following count is incremented by one each time the user iterates
         # on the output generator, it is used to prepare an informative
@@ -1997,13 +2036,12 @@ class Parallel(Logger):
             next(output)
             return output if self.return_generator else list(output)
 
-        # Let's create an ID that uniquely identifies the current call. If the
-        # call is interrupted early and that the same instance is immediately
-        # reused, this id will be used to prevent workers that were
-        # concurrently finalizing a task from the previous call to run the
-        # callback.
-        with self._lock:
-            self._call_id = uuid4().hex
+        # The id uniquely identifying this call was assigned in
+        # `_reset_run_tracking`, before any abort flag was cleared. If the
+        # call is interrupted early and the same instance is immediately
+        # reused, this id prevents workers that are concurrently finalizing a
+        # task from the previous call to run the callback or to be mistaken
+        # for tasks of this call.
 
         # self._effective_n_jobs should be called in the Parallel.__call__
         # thread only -- store its value in an attribute for further queries.
