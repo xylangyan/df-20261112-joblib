@@ -23,6 +23,7 @@ from tempfile import TemporaryDirectory
 
 import pytest
 
+from joblib._multiprocessing_helpers import mp
 from joblib._store_backends import FileSystemStoreBackend, StoreBackendBase
 from joblib.hashing import hash
 from joblib.memory import (
@@ -1894,3 +1895,344 @@ class TestAutoGitignore:
 
         assert gitignore_file.exists()
         assert gitignore_file.read_text() == existing_content
+
+
+###############################################################################
+# Helpers for the exclusive-compute, multi-process tests.
+#
+# These functions are defined at module level so that they stay importable by
+# the child processes (and pickleable by multiprocessing).
+def _exclusive_compute_worker(
+    location,
+    backend_options,
+    partition,
+    counter_path,
+    result_path,
+    events,
+    fail=False,
+):
+    """Compute one cached call in a dedicated process.
+
+    A counter file records the total number of actual computations, while a
+    per-process result file records the object read by this caller. The
+    communication is entirely file based so that the assertions are not
+    influenced by the way the processes were started.
+    """
+    from joblib.test.test_memory import exclusive_compute_partition
+
+    if fail:
+        exclusive_compute_partition.fail_partitions.add(partition)
+    else:
+        exclusive_compute_partition.fail_partitions.discard(partition)
+
+    memory = Memory(
+        location=location, verbose=0, backend_options=backend_options
+    )
+    cached = memory.cache(exclusive_compute_partition)
+
+    # Signal that this process has started and wait until the test driver
+    # releases all the callers, so that concurrent callers hit the same
+    # cache miss together.
+    events["ready"].set()
+    events["start"].wait()
+
+    # Notify the driver when the call lock is actually held (after the
+    # cache miss check, before the computation starts). This makes the
+    # synchronization deterministic even when the computation is fast.
+    if "acquired" in events:
+        from joblib._store_backends import _CallLock
+
+        original_acquire = _CallLock.acquire
+
+        def tracked_acquire(self):
+            acquired = original_acquire(self)
+            events["acquired"].set()
+            return acquired
+
+        _CallLock.acquire = tracked_acquire
+
+    error = None
+    try:
+        result = cached(partition, counter_path)
+    except BaseException as e:
+        error = repr(e)
+        result = None
+
+    with open(result_path, "w") as f:
+        f.write(repr((result, error)))
+
+
+def exclusive_compute_partition(partition, counter_path):
+    """Cached function: it counts its executions and returns a marker."""
+    with open(counter_path, "a") as f:
+        f.write("{}\n".format(os.getpid()))
+    if partition in exclusive_compute_partition.fail_partitions:
+        raise RuntimeError("simulated computation failure")
+    return "result-for-{}-by-{}".format(partition, os.getpid())
+
+
+exclusive_compute_partition.fail_partitions = set()
+
+
+def _start_worker(*args, **kwargs):
+    process = mp.Process(
+        target=_exclusive_compute_worker, args=args, kwargs=kwargs
+    )
+    process.start()
+    return process
+
+
+def _crash_holding_lock(location, backend_options, partition, counter_path):
+    """Acquire the call lock and die without releasing it nor writing output."""
+    memory = Memory(location=location, verbose=0, backend_options=backend_options)
+    cached = memory.cache(exclusive_compute_partition)
+    call_id = (
+        cached.func_id,
+        cached._get_args_id(partition, counter_path),
+    )
+    cached.store_backend.call_lock(call_id).acquire()
+    os._exit(0)
+
+
+def _read_result(path):
+    with open(path) as f:
+        return eval(f.read())
+
+
+def _make_events(with_acquired=False):
+    names = ["ready", "start"]
+    if with_acquired:
+        names.append("acquired")
+    return {name: mp.Event() for name in names}
+
+
+def _wait_until(condition, timeout=10):
+    deadline = time.time() + timeout
+    while not condition():
+        if time.time() > deadline:
+            raise AssertionError("timed out waiting for test condition")
+        time.sleep(0.01)
+
+
+@with_multiprocessing
+def test_exclusive_compute_same_key_runs_once(tmpdir):
+    # Two processes request the same partition (same normalized call key):
+    # only one of them actually computes, the other waits and reads the
+    # result of the first one. Both callers see the exact same object and no
+    # partially written output.
+    location = tmpdir.mkdir("cache").strpath
+    counter_path = tmpdir.join("counter.txt").strpath
+    backend_options = {"exclusive_compute": True}
+    events_by_worker = [_make_events() for _ in range(2)]
+
+    result_paths = [tmpdir.join("result_{}.txt".format(i)).strpath for i in range(2)]
+    workers = [
+        _start_worker(
+            location, backend_options, "partition-1", counter_path,
+            result_paths[i], events_by_worker[i],
+        )
+        for i in range(2)
+    ]
+
+    # Wait for both processes to be blocked on their start event, so they
+    # really race for the same cache miss.
+    for events in events_by_worker:
+        _wait_until(events["ready"].is_set)
+    time.sleep(0.1)
+    for events in events_by_worker:
+        events["start"].set()
+    for process in workers:
+        process.join(timeout=30)
+        assert process.exitcode == 0
+
+    with open(counter_path) as f:
+        pids = [line.strip() for line in f if line.strip()]
+    assert len(pids) == 1, pids
+
+    results = [_read_result(path) for path in result_paths]
+    assert all(error is None for _, error in results)
+    # Both callers read the very same object, written by a single process.
+    assert results[0][0] == results[1][0]
+    assert results[0][0] == "result-for-partition-1-by-{}".format(pids[0])
+
+
+@with_multiprocessing
+def test_exclusive_compute_different_keys_run_in_parallel(tmpdir):
+    # Different partitions give different normalized call keys and hence
+    # different locks: the two computations proceed in parallel, each one
+    # being performed exactly once.
+    location = tmpdir.mkdir("cache").strpath
+    counter_path = tmpdir.join("counter.txt").strpath
+    backend_options = {
+        "exclusive_compute": {
+            "enabled": True,
+            "stale_timeout": 60,
+            "poll_interval": 0.01,
+        }
+    }
+    events_by_worker = [_make_events() for _ in range(2)]
+
+    result_paths = [tmpdir.join("result_{}.txt".format(i)).strpath for i in range(2)]
+    workers = [
+        _start_worker(
+            location, backend_options, "partition-{}".format(i), counter_path,
+            result_paths[i], events_by_worker[i],
+        )
+        for i in range(2)
+    ]
+    for events in events_by_worker:
+        _wait_until(events["ready"].is_set)
+    for events in events_by_worker:
+        events["start"].set()
+    for process in workers:
+        process.join(timeout=30)
+        assert process.exitcode == 0
+
+    with open(counter_path) as f:
+        pids = [line.strip() for line in f if line.strip()]
+    assert sorted(pids) == sorted(str(p.pid) for p in workers)
+
+    results = [_read_result(path) for path in result_paths]
+    assert all(error is None for _, error in results)
+    assert results[0][0] != results[1][0]
+    assert results[0][0].startswith("result-for-partition-0-by-")
+    assert results[1][0].startswith("result-for-partition-1-by-")
+
+
+@with_multiprocessing
+def test_exclusive_compute_failure_is_taken_over(tmpdir):
+    # The first process holding the lock raises while computing: it clears
+    # any partial item before releasing the lock. The waiting process wakes
+    # up, sees no usable result and successfully takes the computation over.
+    location = tmpdir.mkdir("cache").strpath
+    counter_path = tmpdir.join("counter.txt").strpath
+    backend_options = {
+        "exclusive_compute": {"enabled": True, "poll_interval": 0.01}
+    }
+
+    failing_result = tmpdir.join("result_fail.txt").strpath
+    taking_over_result = tmpdir.join("result_ok.txt").strpath
+    failing_events = _make_events(with_acquired=True)
+    failing = _start_worker(
+        location, backend_options, "partition-1", counter_path,
+        failing_result, failing_events, fail=True,
+    )
+    failing_events["ready"].wait(timeout=10)
+    # Start the failing computation and wait until it holds the lock, so
+    # that the second caller is guaranteed to wait behind the first one.
+    failing_events["start"].set()
+    failing_events["acquired"].wait(timeout=10)
+
+    # Now start the second caller for the same key. It has to wait for the
+    # first one, and then take the computation over when it fails.
+    taking_over_events = _make_events()
+    taking_over = _start_worker(
+        location, backend_options, "partition-1", counter_path,
+        taking_over_result, taking_over_events, fail=False,
+    )
+    taking_over_events["ready"].wait(timeout=10)
+    taking_over_events["start"].set()
+
+    failing.join(timeout=30)
+    taking_over.join(timeout=30)
+    assert failing.exitcode == 0
+    assert taking_over.exitcode == 0
+
+    failed_result, failed_error = _read_result(failing_result)
+    assert failed_result is None and failed_error is not None
+    taken_over_result, error = _read_result(taking_over_result)
+    assert error is None
+    assert taken_over_result is not None
+
+    with open(counter_path) as f:
+        pids = [line.strip() for line in f if line.strip()]
+    # One failed attempt followed by one successful attempt.
+    assert len(pids) == 2
+    assert pids[0] == str(failing.pid)
+    assert pids[1] == str(taking_over.pid)
+    assert taken_over_result == "result-for-partition-1-by-{}".format(
+        taking_over.pid
+    )
+
+    # The final state of the cache is a complete, readable item: a later
+    # ordinary call is a cache hit and does not compute again.
+    before = len(pids)
+    memory = Memory(location=location, verbose=0, backend_options=backend_options)
+    assert memory.cache(exclusive_compute_partition)(
+        "partition-1", counter_path
+    ) == taken_over_result
+    with open(counter_path) as f:
+        assert len([line for line in f if line.strip()]) == before
+
+
+@with_multiprocessing
+def test_exclusive_compute_stale_lock_after_crash(tmpdir):
+    # A process that disappears while holding the lock must not block the
+    # other callers forever: after the stale timeout, a waiting process
+    # removes the abandoned lock and takes the computation over.
+    location = tmpdir.mkdir("cache").strpath
+    counter_path = tmpdir.join("counter.txt").strpath
+    backend_options = {
+        "exclusive_compute": {
+            "enabled": True,
+            "stale_timeout": 0.5,
+            "poll_interval": 0.02,
+        }
+    }
+
+    holder = mp.Process(
+        target=_crash_holding_lock,
+        args=(location, backend_options, "partition-1", counter_path),
+    )
+    holder.start()
+    holder.join(timeout=10)
+    assert holder.exitcode == 0
+
+    events = _make_events()
+    result_path = tmpdir.join("result_takeover.txt").strpath
+    taker = _start_worker(
+        location, backend_options, "partition-1", counter_path,
+        result_path, events, fail=False,
+    )
+    events["start"].set()
+    taker.join(timeout=30)
+    assert taker.exitcode == 0
+
+    result, error = _read_result(result_path)
+    assert error is None
+    assert result == "result-for-partition-1-by-{}".format(taker.pid)
+    with open(counter_path) as f:
+        assert len([line for line in f if line.strip()]) == 1
+
+
+def test_exclusive_compute_keeps_ignore_based_cache_key(tmp_path):
+    # Enabling exclusive_compute must not change how call keys are built:
+    # an argument listed in 'ignore' does not participate in the key, and
+    # an item computed with the option off is reused with the option on
+    # (and vice versa).
+    counter_path = str(tmp_path / "counter.txt")
+
+    def counting(x, noisy):
+        with open(counter_path, "a") as f:
+            f.write(".\n")
+        return x
+
+    with TemporaryDirectory() as location:
+        plain = Memory(location=location, verbose=0)
+        cached_plain = plain.cache(counting, ignore=["noisy"])
+        assert cached_plain(1, noisy="a") == 1
+        assert cached_plain(1, noisy="b") == 1
+
+        exclusive = Memory(
+            location=location,
+            verbose=0,
+            backend_options={"exclusive_compute": True},
+        )
+        cached_exclusive = exclusive.cache(counting, ignore=["noisy"])
+        assert cached_exclusive(1, noisy="a") == 1
+        assert cached_exclusive(1, noisy="whatever") == 1
+
+        with open(counter_path) as f:
+            # A single computation, shared by both Memories and every value
+            # of the ignored argument.
+            assert len([line for line in f if line.strip()]) == 1

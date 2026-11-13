@@ -541,26 +541,68 @@ class MemorizedFunc(Logger):
         # function code has changed and check if the results are present in
         # the cache.
         if self._is_in_cache_and_valid(call_id):
-            if shelving:
-                return self._get_memorized_result(call_id), {}
+            cached = self._load_cached_result(call_id, args, kwargs, shelving)
+            if cached is not None:
+                return cached
+            # The item was there but could not be loaded (corrupted item):
+            # fall through and recompute it, under the call lock if enabled.
+
+        # Optional inter-process mutual exclusion, keyed by the normalized
+        # call id. When enabled, only one process computes the call; the
+        # others wait for its result and re-check the cache when they wake
+        # up. Backends that do not implement locking return None, in which
+        # case the behavior is unchanged.
+        call_lock = self.store_backend.call_lock(call_id)
+        if call_lock is None:
+            return self._compute_on_cache_miss(
+                call_id, args, kwargs, shelving, func_name, args_id, location
+            )
+
+        with call_lock:
+            # Another process may have finished the computation while we
+            # were waiting: always re-check the cache before computing.
+            if self._is_in_cache_and_valid(call_id):
+                cached = self._load_cached_result(call_id, args, kwargs, shelving)
+                if cached is not None:
+                    return cached
 
             try:
-                start_time = time.time()
-                output = self._load_item(call_id)
-                if self._verbose > 4:
-                    self._print_duration(
-                        time.time() - start_time, context="cache loaded "
-                    )
-                return output, {}
-            except Exception:
-                # XXX: Should use an exception logger
-                _, signature = format_signature(self.func, *args, **kwargs)
-                self.warn(
-                    "Exception while loading results for {}\n {}".format(
-                        signature, traceback.format_exc()
-                    )
+                return self._compute_on_cache_miss(
+                    call_id, args, kwargs, shelving, func_name, args_id, location
                 )
+            except BaseException:
+                # Do not leave a partially computed item behind: waiting
+                # processes must be able to take the computation over rather
+                # than read an incomplete result.
+                self.store_backend.clear_item(call_id)
+                raise
 
+    def _load_cached_result(self, call_id, args, kwargs, shelving):
+        """Load a result from the cache, or return None if it cannot be read."""
+        if shelving:
+            return self._get_memorized_result(call_id), {}
+
+        try:
+            start_time = time.time()
+            output = self._load_item(call_id)
+            if self._verbose > 4:
+                self._print_duration(
+                    time.time() - start_time, context="cache loaded "
+                )
+            return output, {}
+        except Exception:
+            # XXX: Should use an exception logger
+            _, signature = format_signature(self.func, *args, **kwargs)
+            self.warn(
+                "Exception while loading results for {}\n {}".format(
+                    signature, traceback.format_exc()
+                )
+            )
+            return None
+
+    def _compute_on_cache_miss(
+        self, call_id, args, kwargs, shelving, func_name, args_id, location
+    ):
         if self._verbose > 10:
             self.warn(
                 f"Computing func {func_name}, argument hash {args_id} "
@@ -1015,7 +1057,12 @@ class Memory(Logger):
 
     backend_options: dict, optional
         Contains a dictionary of named parameters used to configure
-        the store backend.
+        the store backend. With the 'local' backend, the
+        'exclusive_compute' option can be enabled (a boolean, or a dict
+        with keys 'enabled', 'timeout', 'stale_timeout' and
+        'poll_interval') so that concurrent processes sharing the cache
+        compute a given call only once: the other processes wait for the
+        result instead of recomputing it.
     """
 
     # ------------------------------------------------------------------------

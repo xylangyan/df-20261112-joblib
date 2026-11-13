@@ -518,6 +518,53 @@ Note a validity duration for cached results can be defined via
     Function run
 
 
+Avoiding duplicate computations across processes
+-------------------------------------------------
+
+When several processes share the same cache directory and request the same
+call at the same time, they may all compute the same result independently
+before writing it to the cache. The ``local`` store backend can optionally
+serialize these concurrent computations so that a given call is only
+computed once: the other processes wait for the first one to finish and
+then read its result. This behavior is opt-in through the
+``exclusive_compute`` backend option::
+
+    >>> from joblib import Memory
+    >>> memory = Memory(
+    ...     location,
+    ...     backend_options={"exclusive_compute": True},
+    ... )
+
+Locking is done per call, keyed by the same normalized call identifier as
+the cached item (function identifier and hash of the arguments): calls with
+different arguments, or calls of different functions, are not blocked by
+each other and keep running in parallel. Waiting processes always re-check
+the cache once the lock is released, and items are written atomically, so
+they never observe a half-written ``output.pkl``.
+
+If the process holding the lock fails or is killed, the lock becomes stale
+and is removed after ``stale_timeout`` seconds (60 by default), letting one
+of the waiting processes take the computation over. Fine-tuning is possible
+by passing a dictionary instead of a boolean, for instance::
+
+    >>> memory = Memory(
+    ...     location,
+    ...     backend_options={
+    ...         "exclusive_compute": {
+    ...             "enabled": True,
+    ...             "timeout": None,         # wait indefinitely for a result
+    ...             "stale_timeout": 60,     # take over an abandoned call
+    ...             "poll_interval": 0.1,    # re-check period while waiting
+    ...         }
+    ...     },
+    ... )
+
+This option only adds lock files alongside the cached items: it does not
+change how call keys are computed, so existing cache directories and keys
+built with the ``ignore`` argument keep working unchanged. When the option
+is not enabled (the default), the behavior is exactly the same as before.
+
+
 .. _memory_reference:
 
 Reference documentation of the :class:`~joblib.Memory` class

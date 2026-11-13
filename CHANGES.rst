@@ -8,6 +8,15 @@ In Development
    This version changes the way functions defined in jupyter notebook are hashed.
    This invalidates existing cache and will automatically clear them in these cases.
 
+- Add an opt-in ``exclusive_compute`` backend option for the ``local`` store
+  backend. When enabled, concurrent processes sharing a cache directory
+  compute a given call (same normalized call key) only once: the other
+  processes wait for the result instead of recomputing it. Locking is done
+  per call so different calls still run in parallel, waiters re-check the
+  cache before computing, and a stale lock left by a crashed process is
+  taken over after a configurable timeout.
+  https://github.com/joblib/joblib/pull/1938
+
 - Fix hashing of ``frozenset`` to be independent of ``PYTHONHASHSEED``.
   https://github.com/joblib/joblib/pull/1914
 

@@ -1,7 +1,9 @@
 """Storage providers backends for Memory caching."""
 
 import collections
+import contextlib
 import datetime
+import errno
 import json
 import operator
 import os
@@ -27,6 +29,92 @@ class CacheWarning(Warning):
     """Warning to capture dump failures except for PicklingError."""
 
     pass
+
+
+class _CallLockTimeout(Exception):
+    """Raised when waiting for a call lock exceeds the allowed timeout."""
+
+
+class _CallLock:
+    """Inter-process lock guarding the computation of a single cached call.
+
+    The lock is materialized by a file created with ``O_CREAT | O_EXCL`` in
+    the item directory of the call. Only one process (the creator) holds the
+    lock at a time; the other processes wait for the lock file to disappear
+    and then re-check the cache.
+
+    The lock file stores the creation time and the pid of its creator. A
+    lock file older than ``stale_timeout`` is considered abandoned (its
+    creator crashed or was killed) and is removed so that a waiting process
+    can take over the computation.
+    """
+
+    def __init__(self, path, timeout=None, stale_timeout=None, poll_interval=0.1):
+        self.path = path
+        self.timeout = timeout
+        self.stale_timeout = stale_timeout
+        self.poll_interval = poll_interval
+        self.acquired = False
+
+    def _is_stale(self):
+        if self.stale_timeout is None:
+            return False
+        try:
+            with open(self.path, "rb") as f:
+                created = float(f.read().decode("utf-8").split()[0])
+        except (OSError, ValueError, IndexError):
+            # The lock file vanished or is being written: it cannot be
+            # considered stale right now.
+            return False
+        return time.time() - created > self.stale_timeout
+
+    def _remove_stale_lock(self):
+        try:
+            os.unlink(self.path)
+        except OSError:
+            # Another waiter removed it first, or the holder released it.
+            pass
+
+    def acquire(self):
+        start_time = time.time()
+        while True:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except OSError as e:
+                if e.errno != errno.EEXIST:
+                    raise
+                if self._is_stale():
+                    # The previous holder crashed or was killed before
+                    # releasing the lock: take the computation over.
+                    self._remove_stale_lock()
+                    continue
+                if self.timeout is not None and time.time() - start_time > (
+                    self.timeout
+                ):
+                    raise _CallLockTimeout(
+                        "Timed out while waiting for the result of the "
+                        "call guarded by lock %s" % self.path
+                    )
+                time.sleep(self.poll_interval)
+            else:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(
+                        "{} {}".format(time.time(), os.getpid()).encode("utf-8")
+                    )
+                self.acquired = True
+                return True
+
+    def release(self):
+        if self.acquired:
+            self.acquired = False
+            with contextlib.suppress(OSError):
+                os.unlink(self.path)
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.release()
 
 
 class StoreBackendBase(metaclass=ABCMeta):
@@ -145,6 +233,17 @@ class StoreBackendBase(metaclass=ABCMeta):
             Contains a dictionary of named parameters used to configure the
             store backend.
         """
+
+    def call_lock(self, call_id):
+        """Return a lock guarding the computation of the given call.
+
+        The default implementation returns None, meaning that no
+        inter-process mutual exclusion is provided: concurrent processes
+        may compute the same call several times. Backends may override
+        this method to return a context manager ensuring that a single
+        process computes the call while the others wait for its result.
+        """
+        return None
 
 
 class StoreBackendMixin(object):
@@ -445,9 +544,17 @@ def _old_split_id(self, call_id):
     return call_id
 
 
-def _reconstructStoreBackend(cls, location, verbose, compress, mmap_mode):
+def _reconstructStoreBackend(
+    cls, location, verbose, compress, mmap_mode, exclusive_compute=False
+):
     obj = cls.__new__(cls)
-    obj.configure(location, verbose, dict(compress=compress, mmap_mode=mmap_mode))
+    obj.configure(
+        location,
+        verbose,
+        dict(
+            compress=compress, mmap_mode=mmap_mode, exclusive_compute=exclusive_compute
+        ),
+    )
     return obj
 
 
@@ -563,7 +670,10 @@ class FileSystemStoreBackend(StoreBackendBase, StoreBackendMixin):
     def configure(self, location, verbose=1, backend_options=None):
         """Configure the store backend.
 
-        For this backend, valid store options are 'compress' and 'mmap_mode'
+        For this backend, valid store options are 'compress', 'mmap_mode'
+        and 'exclusive_compute'. The latter can be a boolean or a dict
+        with keys 'enabled', 'timeout', 'stale_timeout' and
+        'poll_interval'.
         """
         if backend_options is None:
             backend_options = {}
@@ -653,6 +763,48 @@ class FileSystemStoreBackend(StoreBackendBase, StoreBackendMixin):
         self.mmap_mode = mmap_mode
         self.verbose = verbose
 
+        # Optionally ensure that concurrent processes do not compute the
+        # same call (same normalized call_id) more than once. Locking is
+        # done per call, so calls with different arguments still run in
+        # parallel. This is opt-in: when disabled, the backend behaves
+        # exactly as before.
+        exclusive_compute = backend_options.get("exclusive_compute", False)
+        if isinstance(exclusive_compute, bool):
+            exclusive_compute = dict(enabled=exclusive_compute)
+        elif exclusive_compute is None:
+            exclusive_compute = dict(enabled=False)
+        elif not isinstance(exclusive_compute, dict):
+            warnings.warn(
+                "Invalid value for the 'exclusive_compute' backend option "
+                f"(got {exclusive_compute!r}); exclusive computation "
+                "will be disabled.",
+                UserWarning,
+                stacklevel=2,
+            )
+            exclusive_compute = dict(enabled=False)
+        self.exclusive_compute = dict(
+            enabled=exclusive_compute.get("enabled", False),
+            timeout=exclusive_compute.get("timeout"),
+            stale_timeout=exclusive_compute.get("stale_timeout", 60),
+            poll_interval=exclusive_compute.get("poll_interval", 0.1),
+        )
+
+    def call_lock(self, call_id):
+        if not self.exclusive_compute["enabled"]:
+            return None
+        # call_id is split like in the other methods of the store
+        item_path = os.path.join(self.location, *self._split_id(list(call_id)))
+        # The item directory may not exist yet: create it so that the lock
+        # file can be materialized inside it.
+        mkdirp(item_path)
+        lock_path = os.path.join(item_path, ".joblib_call.lock")
+        return _CallLock(
+            lock_path,
+            timeout=self.exclusive_compute["timeout"],
+            stale_timeout=self.exclusive_compute["stale_timeout"],
+            poll_interval=self.exclusive_compute["poll_interval"],
+        )
+
     def _split_id(self, call_id):
         if len(call_id) == 0 or not _check_hex(call_id[-1], 32):
             return call_id
@@ -703,5 +855,6 @@ class FileSystemStoreBackend(StoreBackendBase, StoreBackendMixin):
                 self.verbose,
                 self.compress,
                 self.mmap_mode,
+                self.exclusive_compute,
             ),
         )

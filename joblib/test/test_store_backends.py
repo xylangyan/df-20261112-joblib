@@ -12,6 +12,7 @@ from joblib import Parallel, delayed, numpy_pickle
 from joblib._store_backends import (
     CacheWarning,
     FileSystemStoreBackend,
+    _CallLockTimeout,
     _old_split_id,
 )
 from joblib.test.common import with_multiprocessing
@@ -177,3 +178,117 @@ def test_cache_tree_versions(tmpdir):
     assert old_store.load_item((funs[1], args[0])) == conflict_item
     with raises(KeyError):
         old_store.load_item(("not_a_function", args[0]))
+
+
+def test_exclusive_compute_option_is_opt_in(tmp_path):
+    # By default, the backend does not provide any per-call lock, so that
+    # existing code and existing cache trees are left untouched.
+    backend = FileSystemStoreBackend()
+    backend.configure(str(tmp_path))
+    assert backend.call_lock(("func", "a" * 32)) is None
+    assert backend.exclusive_compute["enabled"] is False
+
+
+def test_exclusive_compute_option_configuration(tmp_path):
+    backend = FileSystemStoreBackend()
+    backend.configure(
+        str(tmp_path),
+        backend_options={
+            "exclusive_compute": {
+                "enabled": True,
+                "timeout": 5,
+                "stale_timeout": 2,
+                "poll_interval": 0.01,
+            }
+        },
+    )
+    assert backend.exclusive_compute == {
+        "enabled": True,
+        "timeout": 5,
+        "stale_timeout": 2,
+        "poll_interval": 0.01,
+    }
+    # Boolean shorthand
+    backend = FileSystemStoreBackend()
+    backend.configure(str(tmp_path), backend_options={"exclusive_compute": True})
+    assert backend.exclusive_compute["enabled"] is True
+    assert backend.call_lock(("func", "a" * 32)) is not None
+
+
+def test_exclusive_compute_lock_is_keyed_by_normalized_call_id(tmp_path):
+    backend = FileSystemStoreBackend()
+    backend.configure(str(tmp_path), backend_options={"exclusive_compute": True})
+
+    # The lock lives inside the item directory, i.e. it uses the same
+    # normalized (split, 3+29) call id as the cached item itself.
+    args_id = "a" * 32
+    lock = backend.call_lock(("func", args_id))
+    assert lock.path == os.path.join(
+        backend.location, "func", args_id[:3], args_id[3:], ".joblib_call.lock"
+    )
+    # Different arguments get different locks and hence can run in parallel.
+    other_lock = backend.call_lock(("func", "b" * 32))
+    assert other_lock.path != lock.path
+
+
+def test_exclusive_compute_lock_roundtrip(tmp_path):
+    backend = FileSystemStoreBackend()
+    backend.configure(
+        str(tmp_path),
+        backend_options={"exclusive_compute": {"enabled": True, "poll_interval": 0.01}},
+    )
+    lock = backend.call_lock(("func", "a" * 32))
+    assert lock.acquire()
+    assert os.path.exists(lock.path)
+    lock.release()
+    assert not os.path.exists(lock.path)
+
+
+def test_exclusive_compute_stale_lock_is_recovered(tmp_path):
+    backend = FileSystemStoreBackend()
+    backend.configure(
+        str(tmp_path),
+        backend_options={
+            "exclusive_compute": {
+                "enabled": True,
+                "stale_timeout": 0.1,
+                "poll_interval": 0.01,
+            }
+        },
+    )
+    lock = backend.call_lock(("func", "a" * 32))
+    os.makedirs(os.path.dirname(lock.path), exist_ok=True)
+    # Simulate a process that died while holding the lock long ago.
+    with open(lock.path, "w") as f:
+        f.write("0 1234")
+    assert lock.acquire()
+    assert lock.acquired
+    lock.release()
+
+
+def test_exclusive_compute_lock_timeout(tmp_path):
+    backend = FileSystemStoreBackend()
+    backend.configure(
+        str(tmp_path),
+        backend_options={
+            "exclusive_compute": {
+                "enabled": True,
+                "timeout": 0.1,
+                "stale_timeout": None,
+                "poll_interval": 0.01,
+            }
+        },
+    )
+    held = backend.call_lock(("func", "a" * 32))
+    held.acquire()
+    other = backend.call_lock(("func", "a" * 32))
+    with raises(_CallLockTimeout):
+        other.acquire()
+    held.release()
+
+
+def test_backend_pickle_preserves_exclusive_compute(tmp_path):
+    backend = FileSystemStoreBackend()
+    backend.configure(str(tmp_path), backend_options={"exclusive_compute": True})
+    unpickled = cpickle.loads(cpickle.dumps(backend))
+    assert unpickled.exclusive_compute["enabled"] is True
